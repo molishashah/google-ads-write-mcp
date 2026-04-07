@@ -15,13 +15,31 @@ export const env = {
   },
 
   // ───────────────────────────────────────────────────────
-  // Layer 1: Google Ads API access (single shared identity)
+  // Layer 1: Google Ads API access (service-account auth)
+  //
+  // The Google Ads API supports service-account auth provided the SA
+  // is registered as a user on the target Google Ads account (or has
+  // domain-wide delegation set up). This is the same model used by
+  // the official Google googleads/google-ads-mcp Python server.
+  //
+  // Provide credentials in ONE of two ways:
+  //   GOOGLE_APPLICATION_CREDENTIALS       — path to a service-account
+  //                                          key JSON file (local dev)
+  //   GOOGLE_APPLICATION_CREDENTIALS_JSON  — inline JSON content
+  //                                          (Vercel / serverless)
+  //
+  // The runtime check that "at least one of the two is set" lives in
+  // lib/ads-client.ts so the more actionable error message can include
+  // the actual env var names being looked at.
   // ───────────────────────────────────────────────────────
   get GOOGLE_ADS_DEVELOPER_TOKEN() {
     return required("GOOGLE_ADS_DEVELOPER_TOKEN");
   },
-  get GOOGLE_ADS_REFRESH_TOKEN() {
-    return required("GOOGLE_ADS_REFRESH_TOKEN");
+  get GOOGLE_APPLICATION_CREDENTIALS() {
+    return optional("GOOGLE_APPLICATION_CREDENTIALS");
+  },
+  get GOOGLE_APPLICATION_CREDENTIALS_JSON() {
+    return optional("GOOGLE_APPLICATION_CREDENTIALS_JSON");
   },
   get GOOGLE_ADS_LOGIN_CUSTOMER_ID() {
     return optional("GOOGLE_ADS_LOGIN_CUSTOMER_ID");
