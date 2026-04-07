@@ -46,25 +46,43 @@ export function registerRsaTools(server: McpServer) {
           .min(2)
           .max(4)
           .describe("2–4 description strings, each max 90 characters"),
+        validate_only: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, validate the request against Google Ads policy and " +
+              "schema rules but do NOT actually create the ad. Useful for " +
+              "testing creative copy without spending. Default: false."
+          ),
       },
     },
     async (params) => {
       try {
         const customer = getAdsClient(params.customer_id);
 
-        const result = await customer.adGroupAds.create([
-          {
-            ad_group: params.ad_group_id,
-            status: enums.AdGroupAdStatus.ENABLED,
-            ad: {
-              final_urls: [params.final_url],
-              responsive_search_ad: {
-                headlines: params.headlines.map((text) => ({ text })),
-                descriptions: params.descriptions.map((text) => ({ text })),
+        const result = await customer.adGroupAds.create(
+          [
+            {
+              ad_group: params.ad_group_id,
+              status: enums.AdGroupAdStatus.ENABLED,
+              ad: {
+                final_urls: [params.final_url],
+                responsive_search_ad: {
+                  headlines: params.headlines.map((text) => ({ text })),
+                  descriptions: params.descriptions.map((text) => ({ text })),
+                },
               },
             },
-          },
-        ]);
+          ],
+          { validate_only: params.validate_only ?? false }
+        );
+
+        if (params.validate_only) {
+          return mcpText(
+            "✅ validate_only: request passed all Google Ads validation " +
+              "(schema, policy, asset limits). No ad was created."
+          );
+        }
 
         const resourceName = result.results?.[0]?.resource_name;
         if (!resourceName) {

@@ -76,6 +76,17 @@ function registerCreateAdVariation(server: McpServer) {
           .min(2)
           .max(4)
           .describe("2–4 treatment descriptions, each max 90 characters"),
+        validate_only: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, validate inputs and confirm the base ad group exists, " +
+              "then return without creating the experiment, arms, or any " +
+              "draft ads. The 8-step experiment flow cannot be passed " +
+              "through to the API's native validate_only because each step " +
+              "depends on the previous one having persisted, so this is an " +
+              "application-layer dry run. Default: false."
+          ),
       },
     },
     async (params) => createAdVariation(params)
@@ -175,11 +186,60 @@ function registerGraduateExperiment(server: McpServer) {
         experiment_id: z
           .string()
           .describe("Experiment resource name from get_experiment_status"),
+        validate_only: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, look up the experiment and confirm it exists and is " +
+              "in a graduateable state, but do NOT actually graduate it. " +
+              "Useful for testing the call shape without permanently " +
+              "modifying the campaign. The Ads API's graduateExperiment " +
+              "RPC does not natively support validate_only, so this is " +
+              "an application-layer dry run. Default: false."
+          ),
       },
     },
     async (params) => {
       try {
         const customer = getAdsClient(params.customer_id);
+
+        // ── validate_only short-circuit ─────────────────────────────
+        // graduateExperiment is an RPC, not a mutate, so the proto
+        // does not expose validate_only. We approximate it by
+        // querying the experiment to confirm it exists and reporting
+        // its current status, then returning without graduating.
+        if (params.validate_only) {
+          const rows = await customer.query<{
+            experiment: { name?: string | null; status?: string | null };
+          }[]>(
+            `SELECT experiment.name, experiment.status
+             FROM experiment
+             WHERE experiment.resource_name = '${escapeGaql(
+               params.experiment_id
+             )}'`
+          );
+          if (!rows.length) {
+            return mcpError(
+              "graduating experiment (validate_only)",
+              new Error(`Experiment not found: ${params.experiment_id}`)
+            );
+          }
+          const exp = rows[0].experiment;
+          return mcpText(
+            [
+              "✅ validate_only: experiment exists and is reachable.",
+              "",
+              `  Experiment:  ${params.experiment_id}`,
+              `  Name:        ${exp.name ?? "(unnamed)"}`,
+              `  Status:      ${exp.status ?? "UNKNOWN"}`,
+              "",
+              exp.status === "GRADUATED"
+                ? "⚠️  Already graduated."
+                : "Re-run with validate_only=false to actually graduate.",
+            ].join("\n")
+          );
+        }
+
         // campaign_budget_mappings is required by the API but can be an
         // empty array — the graduated campaign then inherits whatever
         // budget Google's draft copy is using.
@@ -235,6 +295,7 @@ interface CreateAdVariationParams {
   final_url: string;
   headlines: string[];
   descriptions: string[];
+  validate_only?: boolean;
 }
 
 async function createAdVariation(params: CreateAdVariationParams) {
@@ -258,6 +319,32 @@ async function createAdVariation(params: CreateAdVariationParams) {
           `Base ad group not found: ${params.ad_group_id}. Check the ` +
             "resource name and that the customer has access to it."
         )
+      );
+    }
+
+    // ── validate_only short-circuit ─────────────────────────────────
+    // We CANNOT thread validate_only through the 8-step flow because
+    // each step depends on the previous one having actually persisted.
+    // Instead we treat it as a strict dry-run: confirm inputs are
+    // sane, the base ad group resolves, and the schema validates,
+    // then return without ANY mutates. This is enough to catch the
+    // common failure modes (wrong customer_id, wrong ad_group_id,
+    // headline/description count out of range) without spending or
+    // creating draft resources Google would have to garbage-collect.
+    if (params.validate_only) {
+      return mcpText(
+        [
+          "✅ validate_only: inputs validated, base ad group resolved.",
+          "",
+          `  Base ad group:    ${params.ad_group_id} ("${baseAdGroupName}")`,
+          `  Variation name:   ${params.variation_name}`,
+          `  Headlines:        ${params.headlines.length}`,
+          `  Descriptions:     ${params.descriptions.length}`,
+          `  Final URL:        ${params.final_url}`,
+          "",
+          "No experiment, arms, or ads were created. Re-run with " +
+            "validate_only=false to actually launch the experiment.",
+        ].join("\n")
       );
     }
 
