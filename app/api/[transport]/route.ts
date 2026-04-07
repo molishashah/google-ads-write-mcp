@@ -1,15 +1,12 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { verifyToken } from "@/lib/mcp-auth";
-
-// Tool registrations are added in Phase 3. Keep this file in sync with
-// tools/* as new ones land.
-// import { registerRsaTools } from "@/tools/rsa";
-// import { registerExperimentTools } from "@/tools/experiments";
+import { registerRsaTools } from "@/tools/rsa";
+import { registerExperimentTools } from "@/tools/experiments";
 
 const handler = createMcpHandler(
-  (_server) => {
-    // registerRsaTools(_server);
-    // registerExperimentTools(_server);
+  (server) => {
+    registerRsaTools(server);
+    registerExperimentTools(server);
   },
   {
     serverInfo: {
