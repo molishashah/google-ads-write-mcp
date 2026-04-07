@@ -1,5 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { services } from "google-ads-api";
+import { enums, services } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
 import { mcpText, mcpError } from "@/lib/mcp-helpers";
@@ -7,24 +7,27 @@ import { mcpText, mcpError } from "@/lib/mcp-helpers";
 // ──────────────────────────────────────────────────────────────────────
 // Ad Variation experiment tools
 //
-// Divergence from the v2 PRD
-// --------------------------
-// The PRD's `create_ad_variation` was written against a simplified API
-// that doesn't match google-ads-api v23:
-//   * `IExperiment` has no `campaigns` or `traffic_split_percent` field.
-//   * `IExperimentArm.in_design` doesn't exist — the real field is
-//     `in_design_campaigns: string[]` and it wants a *draft* campaign,
-//     not a boolean.
-//   * Creating a full Ad Variation programmatically requires: (a) copying
-//     the base campaign into a draft, (b) adding the modified ad to the
-//     draft, (c) creating the Experiment, (d) creating control + treatment
-//     arms wired to the draft, (e) scheduling the experiment. That's a
-//     multi-day build with high error surface.
+// Divergence from the PRD
+// -----------------------
+// The PRD's example code was written against a simplified API that
+// doesn't match google-ads-api v23: no `experiments.mutate({operations})`,
+// no `trafficSplitPercent` on Experiment, no boolean `inDesign` on
+// ExperimentArm, camelCase vs snake_case, etc. What IS real in v23:
 //
-// For v2 we stub `create_ad_variation` with a clear error pointing users
-// at the Google Ads UI (which already ergonomically handles all of the
-// above in ~2 minutes). `get_experiment_status` and `graduate_experiment`
-// still work against experiments created in the UI.
+//   1. experiments.create([{name, type=AD_VARIATION, status=SETUP, suffix}])
+//   2. experimentArms.create([control, treatment], response_content_type=
+//      MUTABLE_RESOURCE) — Google auto-creates a draft campaign for the
+//      treatment and returns it via `treatment.in_design_campaigns[0]`.
+//   3. Query the draft campaign to find the copy of the base ad group
+//      (matched by name).
+//   4. Create the new RSA in the draft ad group.
+//   5. Pause any pre-existing ads in the draft ad group so only the new
+//      treatment copy runs.
+//   6. experiments.scheduleExperiment({resource_name}) — begins serving.
+//
+// This mirrors the flow in Google's own Python sample:
+//   https://github.com/googleads/google-ads-python/blob/main/examples/
+//   campaign_management/create_experiment.py
 // ──────────────────────────────────────────────────────────────────────
 
 export function registerExperimentTools(server: McpServer) {
@@ -33,36 +36,49 @@ export function registerExperimentTools(server: McpServer) {
   registerGraduateExperiment(server);
 }
 
-// ── create_ad_variation (STUBBED — see module header) ────────────────
+// ── create_ad_variation ──────────────────────────────────────────────
 function registerCreateAdVariation(server: McpServer) {
   server.registerTool(
     "create_ad_variation",
     {
-      title: "Create Ad Variation Experiment (not implemented)",
+      title: "Create Ad Variation Experiment",
       description:
-        "NOT IMPLEMENTED in v2. Creating an Ad Variation via the API " +
-        "requires copying the base campaign into a draft, modifying the " +
-        "ad inside the draft, then wiring control + treatment arms — a " +
-        "multi-step flow we haven't built yet. For now, create the " +
-        "variation in the Google Ads UI (Campaigns → Experiments → New → " +
-        "Ad variation), then monitor it with get_experiment_status and " +
-        "promote the winner with graduate_experiment.",
+        "Register a copy hypothesis as a Google Ad Variation experiment. " +
+        "Creates an Experiment + control/treatment arms, adds a new RSA " +
+        "with the provided headlines/descriptions to the auto-generated " +
+        "draft ad group, pauses existing ads in that draft group so only " +
+        "the new treatment runs, and schedules the experiment. Google " +
+        "then runs a 50/50 split and delivers a statistical verdict. Use " +
+        "this when testing a new creative angle against a working baseline;" +
+        " use create_responsive_search_ad + pause_ad for clearly broken ads.",
       inputSchema: {
-        customer_id: z.string(),
-        campaign_id: z.string(),
-        variation_name: z.string(),
+        customer_id: z
+          .string()
+          .describe("Google Ads customer ID, no hyphens"),
+        campaign_id: z
+          .string()
+          .describe("Base campaign resource name (e.g. 'customers/123/campaigns/789')"),
+        ad_group_id: z
+          .string()
+          .describe("Base ad group resource name (e.g. 'customers/123/adGroups/456')"),
+        variation_name: z
+          .string()
+          .max(64)
+          .describe("Human-readable label (e.g. 'capability-framing-apr8')"),
+        final_url: z.string().url().describe("Landing page URL for the treatment ad"),
+        headlines: z
+          .array(z.string().max(30))
+          .min(3)
+          .max(15)
+          .describe("3–15 treatment headlines, each max 30 characters"),
+        descriptions: z
+          .array(z.string().max(90))
+          .min(2)
+          .max(4)
+          .describe("2–4 treatment descriptions, each max 90 characters"),
       },
     },
-    async () => {
-      return mcpError(
-        "creating ad variation",
-        new Error(
-          "create_ad_variation is not implemented in this MCP. Use the " +
-            "Google Ads UI to create the variation, then use " +
-            "get_experiment_status / graduate_experiment to manage it."
-        )
-      );
-    }
+    async (params) => createAdVariation(params)
   );
 }
 
@@ -209,4 +225,183 @@ interface ExperimentRow {
 function escapeGaql(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
+
+// ── create_ad_variation implementation ──────────────────────────────
+interface CreateAdVariationParams {
+  customer_id: string;
+  campaign_id: string;
+  ad_group_id: string;
+  variation_name: string;
+  final_url: string;
+  headlines: string[];
+  descriptions: string[];
+}
+
+async function createAdVariation(params: CreateAdVariationParams) {
+  try {
+    const customer = getAdsClient(params.customer_id);
+
+    // Step 1: Look up the base ad group's name so we can find the draft
+    // copy Google creates inside the treatment arm's draft campaign.
+    const baseAdGroupRows = await customer.query<{
+      ad_group: { name?: string | null };
+    }[]>(
+      `SELECT ad_group.name
+       FROM ad_group
+       WHERE ad_group.resource_name = '${escapeGaql(params.ad_group_id)}'`
+    );
+    const baseAdGroupName = baseAdGroupRows[0]?.ad_group?.name;
+    if (!baseAdGroupName) {
+      return mcpError(
+        "creating ad variation",
+        new Error(
+          `Base ad group not found: ${params.ad_group_id}. Check the ` +
+            "resource name and that the customer has access to it."
+        )
+      );
+    }
+
+    // Step 2: Create the Experiment shell.
+    const expResult = await customer.experiments.create([
+      {
+        name: params.variation_name,
+        type: enums.ExperimentType.AD_VARIATION,
+        suffix: ` [${params.variation_name}]`,
+        status: enums.ExperimentStatus.SETUP,
+      },
+    ]);
+    const experimentResourceName = expResult.results?.[0]?.resource_name;
+    if (!experimentResourceName) {
+      return mcpError(
+        "creating ad variation",
+        new Error("experiments.create succeeded but returned no resource_name")
+      );
+    }
+
+    // Step 3: Create control + treatment arms in one call.
+    // MUTABLE_RESOURCE response lets us read the auto-generated draft
+    // campaign for the treatment arm.
+    const armsResult = await customer.experimentArms.create(
+      [
+        {
+          experiment: experimentResourceName,
+          name: "control",
+          control: true,
+          campaigns: [params.campaign_id],
+          traffic_split: 50,
+        },
+        {
+          experiment: experimentResourceName,
+          name: "treatment",
+          control: false,
+          traffic_split: 50,
+        },
+      ],
+      { response_content_type: enums.ResponseContentType.MUTABLE_RESOURCE }
+    );
+    const treatmentArm = armsResult.results?.[1]?.experiment_arm;
+    const draftCampaign = treatmentArm?.in_design_campaigns?.[0];
+    if (!draftCampaign) {
+      return mcpError(
+        "creating ad variation",
+        new Error(
+          "experimentArms.create succeeded but no draft campaign was " +
+            "returned for the treatment arm. Check MUTABLE_RESOURCE support."
+        )
+      );
+    }
+
+    // Step 4: Find the draft copy of the base ad group (matched by name).
+    const draftAdGroupRows = await customer.query<{
+      ad_group: { resource_name?: string | null };
+    }[]>(
+      `SELECT ad_group.resource_name
+       FROM ad_group
+       WHERE ad_group.campaign = '${escapeGaql(draftCampaign)}'
+         AND ad_group.name = '${escapeGaql(baseAdGroupName)}'`
+    );
+    const draftAdGroup = draftAdGroupRows[0]?.ad_group?.resource_name;
+    if (!draftAdGroup) {
+      return mcpError(
+        "creating ad variation",
+        new Error(
+          `Could not find draft copy of ad group "${baseAdGroupName}" in ` +
+            `draft campaign ${draftCampaign}.`
+        )
+      );
+    }
+
+    // Step 5: Query existing draft ads so we can pause them after creating
+    // the new treatment RSA.
+    const existingDraftAdsRows = await customer.query<{
+      ad_group_ad: { resource_name?: string | null; status?: string | null };
+    }[]>(
+      `SELECT ad_group_ad.resource_name, ad_group_ad.status
+       FROM ad_group_ad
+       WHERE ad_group_ad.ad_group = '${escapeGaql(draftAdGroup)}'`
+    );
+
+    // Step 6: Create the new treatment RSA in the draft ad group.
+    const newAdResult = await customer.adGroupAds.create([
+      {
+        ad_group: draftAdGroup,
+        status: enums.AdGroupAdStatus.ENABLED,
+        ad: {
+          final_urls: [params.final_url],
+          responsive_search_ad: {
+            headlines: params.headlines.map((text) => ({ text })),
+            descriptions: params.descriptions.map((text) => ({ text })),
+          },
+        },
+      },
+    ]);
+    const newAdResourceName = newAdResult.results?.[0]?.resource_name;
+    if (!newAdResourceName) {
+      return mcpError(
+        "creating ad variation",
+        new Error("adGroupAds.create succeeded but returned no resource_name")
+      );
+    }
+
+    // Step 7: Pause any pre-existing ads in the draft ad group so only
+    // the new treatment copy runs.
+    const toPause = existingDraftAdsRows
+      .map((row) => row.ad_group_ad)
+      .filter(
+        (ad): ad is { resource_name: string; status?: string | null } =>
+          !!ad?.resource_name && ad.status !== "PAUSED"
+      );
+    if (toPause.length > 0) {
+      await customer.adGroupAds.update(
+        toPause.map((ad) => ({
+          resource_name: ad.resource_name,
+          status: enums.AdGroupAdStatus.PAUSED,
+        }))
+      );
+    }
+
+    // Step 8: Schedule the experiment to start serving traffic.
+    await customer.experiments.scheduleExperiment(
+      services.ScheduleExperimentRequest.create({
+        resource_name: experimentResourceName,
+      })
+    );
+
+    return mcpText(
+      [
+        `Experiment created: ${experimentResourceName}`,
+        `Draft campaign:    ${draftCampaign}`,
+        `Draft ad group:    ${draftAdGroup}`,
+        `New treatment ad:  ${newAdResourceName}`,
+        `Paused ${toPause.length} original ad(s) in the draft group.`,
+        "",
+        "Google will run a 50/50 control vs. treatment split.",
+        "Check status in 2–4 weeks with get_experiment_status.",
+      ].join("\n")
+    );
+  } catch (err) {
+    return mcpError("creating ad variation", err);
+  }
+}
+
 
