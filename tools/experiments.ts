@@ -100,10 +100,15 @@ function registerGetExperimentStatus(server: McpServer) {
     {
       title: "Get Ad Variation Experiment Status",
       description:
-        "Check the status and verdict of an Ad Variation experiment " +
-        "created in the Google Ads UI (or elsewhere). Returns ENABLED " +
-        "(still running), GRADUATED (Google has a verdict), HALTED, or " +
-        "other lifecycle states.",
+        "Check the status of an Ad Variation experiment AND fetch " +
+        "per-arm performance metrics so the agent can score winner / " +
+        "loser / inconclusive. Returns the experiment lifecycle state " +
+        "(SETUP, INITIATED, RUNNING, GRADUATED, HALTED, PROMOTED, " +
+        "REMOVED) plus metrics (impressions, clicks, conversions, " +
+        "conversion_rate) aggregated per arm (control vs. treatment) " +
+        "across the experiment's campaigns over the last 30 days. " +
+        "Used by autoresearch-ads Step 3 to score launched ad_variation " +
+        "experiments. Returns JSON for downstream parsing.",
       inputSchema: {
         customer_id: z
           .string()
@@ -118,8 +123,9 @@ function registerGetExperimentStatus(server: McpServer) {
     async (params) => {
       try {
         const customer = getAdsClient(params.customer_id);
-        // Parameterised GAQL to avoid string-injection into the query.
-        const rows = await customer.query<
+
+        // Step 1: experiment metadata
+        const expRows = await customer.query<
           { experiment: ExperimentRow }[]
         >(
           `SELECT
@@ -134,33 +140,185 @@ function registerGetExperimentStatus(server: McpServer) {
            )}'`
         );
 
-        if (!rows.length) {
+        if (!expRows.length) {
           return mcpError(
             "fetching experiment",
             new Error(`Experiment not found: ${params.experiment_id}`)
           );
         }
+        const exp = expRows[0].experiment;
+        const status = normalizeExperimentStatus(exp.status);
 
-        const exp = rows[0].experiment;
-        const lines = [
-          `Experiment: ${exp.name}`,
-          `Status: ${exp.status}`,
-          `Started: ${exp.start_date ?? "unknown"}`,
-          `Ended: ${exp.end_date ?? "still running"}`,
-        ];
-        if (exp.status === "GRADUATED") {
-          lines.push(
-            "",
-            "Google has reached a verdict. Call graduate_experiment to " +
-              "promote the winner, or do nothing to keep the control."
+        // Step 2: per-arm metadata (control flag + campaigns list)
+        const armRows = await customer.query<
+          {
+            experiment_arm: {
+              resource_name?: string | null;
+              name?: string | null;
+              control?: boolean | null;
+              campaigns?: string[] | null;
+              traffic_split?: number | null;
+            };
+          }[]
+        >(
+          `SELECT
+             experiment_arm.resource_name,
+             experiment_arm.name,
+             experiment_arm.control,
+             experiment_arm.campaigns,
+             experiment_arm.traffic_split
+           FROM experiment_arm
+           WHERE experiment_arm.experiment = '${escapeGaql(
+             params.experiment_id
+           )}'`
+        );
+
+        const arms = armRows.map((r) => ({
+          resource_name: r.experiment_arm?.resource_name ?? "",
+          name: r.experiment_arm?.name ?? "",
+          control: !!r.experiment_arm?.control,
+          campaigns: r.experiment_arm?.campaigns ?? [],
+          traffic_split: r.experiment_arm?.traffic_split ?? 0,
+        }));
+
+        // Step 3: aggregate metrics per arm by summing each arm's
+        // campaigns. We do this with a single campaign query and
+        // bucket results in JS, rather than N queries.
+        const allCampaigns = Array.from(
+          new Set(arms.flatMap((a) => a.campaigns))
+        );
+
+        type CampaignMetrics = {
+          impressions: number;
+          clicks: number;
+          conversions: number;
+        };
+        const metricsByCampaign = new Map<string, CampaignMetrics>();
+
+        if (allCampaigns.length > 0) {
+          const inClause = allCampaigns
+            .map((c) => `'${escapeGaql(c)}'`)
+            .join(", ");
+          const campRows = await customer.query<
+            {
+              campaign: { resource_name?: string | null };
+              metrics: {
+                impressions?: number | null;
+                clicks?: number | null;
+                conversions?: number | null;
+              };
+            }[]
+          >(
+            `SELECT
+               campaign.resource_name,
+               metrics.impressions,
+               metrics.clicks,
+               metrics.conversions
+             FROM campaign
+             WHERE campaign.resource_name IN (${inClause})
+               AND segments.date DURING LAST_30_DAYS`
           );
-        } else if (exp.status === "ENABLED") {
-          lines.push(
-            "",
-            "Still running — check back later. Typical maturity: 2–4 weeks."
+          for (const row of campRows) {
+            const rn = row.campaign?.resource_name;
+            if (!rn) continue;
+            const prev = metricsByCampaign.get(rn) ?? {
+              impressions: 0,
+              clicks: 0,
+              conversions: 0,
+            };
+            metricsByCampaign.set(rn, {
+              impressions: prev.impressions + (row.metrics?.impressions ?? 0),
+              clicks: prev.clicks + (row.metrics?.clicks ?? 0),
+              conversions: prev.conversions + (row.metrics?.conversions ?? 0),
+            });
+          }
+        }
+
+        const armResults = arms.map((arm) => {
+          let impressions = 0;
+          let clicks = 0;
+          let conversions = 0;
+          for (const camp of arm.campaigns) {
+            const m = metricsByCampaign.get(camp);
+            if (m) {
+              impressions += m.impressions;
+              clicks += m.clicks;
+              conversions += m.conversions;
+            }
+          }
+          const conversion_rate = clicks > 0 ? conversions / clicks : 0;
+          return {
+            name: arm.name,
+            role: arm.control ? "control" : "treatment",
+            traffic_split: arm.traffic_split,
+            campaigns: arm.campaigns,
+            metrics: {
+              impressions,
+              clicks,
+              conversions,
+              conversion_rate: Number(conversion_rate.toFixed(6)),
+            },
+          };
+        });
+
+        // Compute the verdict comparison the agent needs for Step 3.
+        const control = armResults.find((a) => a.role === "control");
+        const treatment = armResults.find((a) => a.role === "treatment");
+        let lift_vs_control: number | null = null;
+        if (
+          control &&
+          treatment &&
+          control.metrics.conversion_rate > 0
+        ) {
+          lift_vs_control = Number(
+            (
+              (treatment.metrics.conversion_rate -
+                control.metrics.conversion_rate) /
+              control.metrics.conversion_rate
+            ).toFixed(4)
           );
         }
-        return mcpText(lines.join("\n"));
+
+        // Status hint mirrors the actual Google Ads enum values.
+        let hint = "";
+        if (status === "GRADUATED") {
+          hint =
+            "Google has reached a verdict. Call graduate_experiment to " +
+            "promote the winner, or do nothing to keep the control.";
+        } else if (status === "PROMOTED") {
+          hint =
+            "Already promoted — the treatment is now the permanent ad. " +
+            "No further action needed.";
+        } else if (status === "RUNNING") {
+          hint =
+            "Still running — check back later. Typical maturity: 2–4 weeks.";
+        } else if (status === "SETUP" || status === "INITIATED") {
+          hint =
+            "Not yet collecting data. Call scheduleExperiment if SETUP.";
+        } else if (status === "HALTED" || status === "REMOVED") {
+          hint = "Experiment is no longer collecting data.";
+        }
+
+        const result = {
+          experiment: {
+            resource_name: exp.resource_name ?? params.experiment_id,
+            name: exp.name ?? null,
+            status: status ?? "UNKNOWN",
+            start_date: exp.start_date ?? null,
+            end_date: exp.end_date ?? null,
+          },
+          arms: armResults,
+          comparison: {
+            control_conversion_rate:
+              control?.metrics.conversion_rate ?? null,
+            treatment_conversion_rate:
+              treatment?.metrics.conversion_rate ?? null,
+            lift_vs_control,
+          },
+          hint,
+        };
+
+        return mcpText(JSON.stringify(result, null, 2));
       } catch (err) {
         return mcpError("fetching experiment status", err);
       }
@@ -210,7 +368,7 @@ function registerGraduateExperiment(server: McpServer) {
         // its current status, then returning without graduating.
         if (params.validate_only) {
           const rows = await customer.query<{
-            experiment: { name?: string | null; status?: string | null };
+            experiment: { name?: string | null; status?: string | number | null };
           }[]>(
             `SELECT experiment.name, experiment.status
              FROM experiment
@@ -225,16 +383,17 @@ function registerGraduateExperiment(server: McpServer) {
             );
           }
           const exp = rows[0].experiment;
+          const expStatus = normalizeExperimentStatus(exp.status);
           return mcpText(
             [
               "✅ validate_only: experiment exists and is reachable.",
               "",
               `  Experiment:  ${params.experiment_id}`,
               `  Name:        ${exp.name ?? "(unnamed)"}`,
-              `  Status:      ${exp.status ?? "UNKNOWN"}`,
+              `  Status:      ${expStatus ?? "UNKNOWN"}`,
               "",
-              exp.status === "GRADUATED"
-                ? "⚠️  Already graduated."
+              expStatus === "GRADUATED" || expStatus === "PROMOTED"
+                ? "⚠️  Already graduated/promoted."
                 : "Re-run with validate_only=false to actually graduate.",
             ].join("\n")
           );
@@ -271,9 +430,26 @@ function registerGraduateExperiment(server: McpServer) {
 interface ExperimentRow {
   resource_name?: string | null;
   name?: string | null;
-  status?: string | null;
+  status?: string | number | null;
   start_date?: string | null;
   end_date?: string | null;
+}
+
+/**
+ * Normalise an ExperimentStatus value into the canonical string. The
+ * TypeScript google-ads-api package can return enum fields as either
+ * the integer value or the string label depending on the protobuf
+ * accessor used. The agent expects strings ("RUNNING", "GRADUATED",
+ * etc.) so we always coerce.
+ */
+function normalizeExperimentStatus(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === "string") return value;
+  if (typeof value === "number") {
+    const map = enums.ExperimentStatus as unknown as Record<number, string>;
+    return map[value] ?? String(value);
+  }
+  return String(value);
 }
 
 /**
