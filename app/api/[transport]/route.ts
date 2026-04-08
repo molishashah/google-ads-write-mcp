@@ -3,12 +3,14 @@ import { verifyToken } from "@/lib/mcp-auth";
 import { registerRsaTools } from "@/tools/rsa";
 import { registerExperimentTools } from "@/tools/experiments";
 import { registerAdLifecycleTools } from "@/tools/ad-lifecycle";
+import { registerAdReadTools } from "@/tools/ad-read";
 
 const handler = createMcpHandler(
   (server) => {
     registerRsaTools(server);
     registerExperimentTools(server);
     registerAdLifecycleTools(server);
+    registerAdReadTools(server);
   },
   {
     serverInfo: {
