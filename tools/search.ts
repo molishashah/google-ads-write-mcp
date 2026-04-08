@@ -119,7 +119,7 @@ function registerListAccessibleCustomers(server: McpServer) {
         }
 
         const res = await fetch(
-          "https://googleads.googleapis.com/v19/customers:listAccessibleCustomers",
+          "https://googleads.googleapis.com/v23/customers:listAccessibleCustomers",
           {
             headers: {
               Authorization: `Bearer ${tokenResponse.token}`,
