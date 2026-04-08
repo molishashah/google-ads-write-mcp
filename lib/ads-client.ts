@@ -43,6 +43,10 @@ const ADS_SCOPE = "https://www.googleapis.com/auth/adwords";
 // parse + file read are not free, so we memoise across requests.
 let cachedAuthClient: JWT | null = null;
 
+export function getAuthClientForApi(): JWT {
+  return getAuthClient();
+}
+
 function getAuthClient(): JWT {
   if (cachedAuthClient) return cachedAuthClient;
 
@@ -98,6 +102,14 @@ function getAuthClient(): JWT {
 // developer_token IS used by the gRPC interceptor on every call, so
 // it must be the real token.
 let adsApi: GoogleAdsApi | null = null;
+
+export function getAdsApi() {
+  return getApi();
+}
+
+export function getDeveloperToken(): string {
+  return env.GOOGLE_ADS_DEVELOPER_TOKEN;
+}
 
 function getApi(): GoogleAdsApi {
   if (adsApi) return adsApi;
