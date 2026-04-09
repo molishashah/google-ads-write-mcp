@@ -5,6 +5,7 @@ import { registerExperimentTools } from "@/tools/experiments";
 import { registerAdLifecycleTools } from "@/tools/ad-lifecycle";
 import { registerAdReadTools } from "@/tools/ad-read";
 import { registerSearchTools } from "@/tools/search";
+import { registerKeywordTools } from "@/tools/keywords";
 
 const handler = createMcpHandler(
   (server) => {
@@ -13,6 +14,7 @@ const handler = createMcpHandler(
     registerAdLifecycleTools(server);
     registerAdReadTools(server);
     registerSearchTools(server);
+    registerKeywordTools(server);
   },
   {
     serverInfo: {
