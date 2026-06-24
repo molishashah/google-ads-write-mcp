@@ -31,6 +31,12 @@ The MCP endpoint is served at `/api/[transport]` and protected by `withMcpAuth`.
 | `pause_campaign` | Pause a campaign |
 | `pause_ad_group` | Pause an ad group |
 | `pause_ad` | Pause an ad |
+| `get_conversion_customer` | Show the effective conversion customer, customer data terms, and EC4L status |
+| `list_conversion_actions` | List conversion actions, including `UPLOAD_CLICKS` actions for offline uploads |
+| `create_conversion_action` | Create an `UPLOAD_CLICKS` conversion action |
+| `validate_offline_conversion_payload` | Locally validate offline conversion / EC4L payloads |
+| `upload_click_conversions` | Upload offline click conversions / EC4L events with partial failure enabled |
+| `get_offline_conversion_diagnostics` | Read offline conversion upload diagnostics |
 
 ## Tech stack
 

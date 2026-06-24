@@ -7,6 +7,7 @@ import { registerAdReadTools } from "@/tools/ad-read";
 import { registerSearchTools } from "@/tools/search";
 import { registerKeywordTools } from "@/tools/keywords";
 import { registerCampaignTools } from "@/tools/campaign";
+import { registerConversionTools } from "@/tools/conversions";
 
 const handler = createMcpHandler(
   (server) => {
@@ -17,6 +18,7 @@ const handler = createMcpHandler(
     registerSearchTools(server);
     registerKeywordTools(server);
     registerCampaignTools(server);
+    registerConversionTools(server);
   },
   {
     serverInfo: {
