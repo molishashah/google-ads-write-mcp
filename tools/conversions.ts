@@ -1,0 +1,1339 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { enums, services } from "google-ads-api";
+import { z } from "zod";
+import { getAdsClient } from "@/lib/ads-client";
+import { formatError, mcpError, mcpText } from "@/lib/mcp-helpers";
+
+const CUSTOMER_ID_RE = /^\d+$/;
+const CONVERSION_ACTION_RE = /^customers\/(\d+)\/conversionActions\/(\d+)$/;
+const GOOGLE_DATE_TIME_RE =
+  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+const SHA256_HEX_ANY_CASE_RE = /^[a-fA-F0-9]{64}$/;
+const ENUM_RE = /^[A-Z][A-Z0-9_]*$/;
+const DEFAULT_CONVERSION_WINDOW_DAYS = 90;
+
+type ErrorClass =
+  | "config"
+  | "config/auth"
+  | "data"
+  | "duplicate"
+  | "retryable"
+  | "warning/data"
+  | "unknown";
+
+type ValidationIssue = {
+  index: number;
+  field: string;
+  class: ErrorClass;
+  message: string;
+};
+
+type NormalizedClickConversion = {
+  conversionAction: string;
+  conversionDateTime: string;
+  orderId: string;
+  hashedEmail: string;
+  gclid?: string;
+  gbraid?: string;
+  wbraid?: string;
+  currencyCode?: string;
+  conversionValue?: number;
+  consent?: {
+    adUserData?: "GRANTED" | "DENIED" | "UNSPECIFIED";
+    adPersonalization?: "GRANTED" | "DENIED" | "UNSPECIFIED";
+  };
+  conversionEnvironment?: "APP" | "WEB" | "UNSPECIFIED" | "UNKNOWN";
+  customerType?: "NEW" | "RETURNING" | "UNSPECIFIED" | "UNKNOWN";
+};
+
+type RawClickConversion = {
+  conversionAction?: string;
+  conversion_action?: string;
+  conversionDateTime?: string;
+  conversion_date_time?: string;
+  orderId?: string;
+  order_id?: string;
+  hashedEmail?: string;
+  hashed_email?: string;
+  emailSha256?: string;
+  email_sha256?: string;
+  gclid?: string;
+  gbraid?: string;
+  wbraid?: string;
+  currencyCode?: string;
+  currency_code?: string;
+  conversionValue?: number;
+  conversion_value?: number;
+  consent?: NormalizedClickConversion["consent"];
+  conversionEnvironment?: NormalizedClickConversion["conversionEnvironment"];
+  conversion_environment?: NormalizedClickConversion["conversionEnvironment"];
+  customerType?: NormalizedClickConversion["customerType"];
+  customer_type?: NormalizedClickConversion["customerType"];
+};
+
+type GoogleAdsFailureLike = {
+  errors?: GoogleAdsErrorLike[];
+  request_id?: string;
+  requestId?: string;
+};
+
+type GoogleAdsErrorLike = {
+  error_code?: Record<string, string | number | null | undefined>;
+  errorCode?: Record<string, string | number | null | undefined>;
+  message?: string;
+  location?: {
+    field_path_elements?: FieldPathElementLike[];
+    fieldPathElements?: FieldPathElementLike[];
+  };
+  trigger?: unknown;
+};
+
+type FieldPathElementLike = {
+  field_name?: string;
+  fieldName?: string;
+  index?: number | string | null;
+};
+
+type ParsedGoogleAdsError = {
+  index: number | null;
+  codeCategory: string | null;
+  code: string | null;
+  class: ErrorClass;
+  message: string;
+  fieldPath: string;
+};
+
+const consentSchema = z
+  .object({
+    adUserData: z.enum(["GRANTED", "DENIED", "UNSPECIFIED"]).optional(),
+    adPersonalization: z.enum(["GRANTED", "DENIED", "UNSPECIFIED"]).optional(),
+  })
+  .optional();
+
+const clickConversionSchema = z.object({
+  conversionAction: z.string().optional(),
+  conversion_action: z.string().optional(),
+  conversionDateTime: z.string().optional(),
+  conversion_date_time: z.string().optional(),
+  orderId: z.string().optional(),
+  order_id: z.string().optional(),
+  hashedEmail: z.string().optional(),
+  hashed_email: z.string().optional(),
+  emailSha256: z.string().optional(),
+  email_sha256: z.string().optional(),
+  gclid: z.string().optional(),
+  gbraid: z.string().optional(),
+  wbraid: z.string().optional(),
+  currencyCode: z.string().length(3).optional(),
+  currency_code: z.string().length(3).optional(),
+  conversionValue: z.number().finite().optional(),
+  conversion_value: z.number().finite().optional(),
+  consent: consentSchema,
+  conversionEnvironment: z
+    .enum(["APP", "WEB", "UNSPECIFIED", "UNKNOWN"])
+    .optional(),
+  conversion_environment: z
+    .enum(["APP", "WEB", "UNSPECIFIED", "UNKNOWN"])
+    .optional(),
+  customerType: z.enum(["NEW", "RETURNING", "UNSPECIFIED", "UNKNOWN"]).optional(),
+  customer_type: z.enum(["NEW", "RETURNING", "UNSPECIFIED", "UNKNOWN"]).optional(),
+});
+
+export function registerConversionTools(server: McpServer) {
+  registerGetConversionCustomer(server);
+  registerListConversionActions(server);
+  registerCreateConversionAction(server);
+  registerValidateOfflineConversionPayload(server);
+  registerUploadClickConversions(server);
+  registerGetOfflineConversionDiagnostics(server);
+}
+
+function registerGetConversionCustomer(server: McpServer) {
+  server.registerTool(
+    "get_conversion_customer",
+    {
+      title: "Get Conversion Customer",
+      description:
+        "Return the effective Google Ads conversion customer for an account, " +
+        "plus customer data terms and enhanced conversions for leads status.",
+      inputSchema: {
+        customerId: z
+          .string()
+          .optional()
+          .describe("Google Ads customer ID, no hyphens."),
+        customer_id: z
+          .string()
+          .optional()
+          .describe("Alias for customerId, kept for this MCP's older tools."),
+      },
+    },
+    async (params) => {
+      const customerId = requireCustomerId(params);
+      if (!customerId.ok) return customerId.error;
+
+      try {
+        const requested = await fetchConversionTrackingSetting(customerId.value);
+        const conversionCustomerId = parseCustomerId(
+          requested.conversion_customer_resource_name
+        );
+
+        let conversionCustomer = requested;
+        if (conversionCustomerId && conversionCustomerId !== customerId.value) {
+          try {
+            conversionCustomer =
+              await fetchConversionTrackingSetting(conversionCustomerId);
+          } catch (err) {
+            return mcpText(
+              JSON.stringify(
+                {
+                  requested_customer: requested,
+                  conversion_customer_lookup_error: formatError(err),
+                },
+                null,
+                2
+              )
+            );
+          }
+        }
+
+        return mcpText(
+          JSON.stringify(
+            {
+              requested_customer: requested,
+              conversion_customer: conversionCustomer,
+            },
+            null,
+            2
+          )
+        );
+      } catch (err) {
+        return mcpError("fetching conversion customer", err);
+      }
+    }
+  );
+}
+
+function registerListConversionActions(server: McpServer) {
+  server.registerTool(
+    "list_conversion_actions",
+    {
+      title: "List Conversion Actions",
+      description:
+        "List conversion actions for a Google Ads conversion customer. " +
+        "Use type=UPLOAD_CLICKS to discover actions eligible for offline " +
+        "click conversions and enhanced conversions for leads.",
+      inputSchema: {
+        customerId: z.string().optional().describe("Google Ads customer ID."),
+        customer_id: z.string().optional().describe("Alias for customerId."),
+        status: z
+          .string()
+          .optional()
+          .describe("Optional enum filter, e.g. ENABLED or HIDDEN."),
+        type: z
+          .string()
+          .optional()
+          .describe("Optional enum filter, e.g. UPLOAD_CLICKS."),
+      },
+    },
+    async (params) => {
+      const customerId = requireCustomerId(params);
+      if (!customerId.ok) return customerId.error;
+
+      try {
+        const conditions: string[] = [];
+        if (params.status) {
+          conditions.push(
+            `conversion_action.status = ${sanitizeEnum(params.status)}`
+          );
+        }
+        if (params.type) {
+          conditions.push(`conversion_action.type = ${sanitizeEnum(params.type)}`);
+        }
+
+        const customer = getAdsClient(customerId.value);
+        const rows = await customer.query<
+          {
+            conversion_action: {
+              resource_name?: string | null;
+              id?: number | string | null;
+              name?: string | null;
+              status?: string | number | null;
+              type?: string | number | null;
+              category?: string | number | null;
+              include_in_conversions_metric?: boolean | null;
+              counting_type?: string | number | null;
+            };
+          }[]
+        >(
+          `SELECT
+             conversion_action.resource_name,
+             conversion_action.id,
+             conversion_action.name,
+             conversion_action.status,
+             conversion_action.type,
+             conversion_action.category,
+             conversion_action.include_in_conversions_metric,
+             conversion_action.counting_type
+           FROM conversion_action` +
+            (conditions.length ? ` WHERE ${conditions.join(" AND ")}` : "") +
+            ` ORDER BY conversion_action.name`
+        );
+
+        const actions = rows.map((row) => {
+          const action = row.conversion_action;
+          return {
+            resource_name: action.resource_name ?? null,
+            id: action.id != null ? String(action.id) : null,
+            name: action.name ?? null,
+            status: normalizeEnumLabel(action.status),
+            type: normalizeEnumLabel(action.type),
+            category: normalizeEnumLabel(action.category),
+            include_in_conversions: action.include_in_conversions_metric ?? null,
+            counting_type: normalizeEnumLabel(action.counting_type),
+          };
+        });
+
+        return mcpText(JSON.stringify({ conversion_actions: actions }, null, 2));
+      } catch (err) {
+        return mcpError("listing conversion actions", err);
+      }
+    }
+  );
+}
+
+function registerCreateConversionAction(server: McpServer) {
+  server.registerTool(
+    "create_conversion_action",
+    {
+      title: "Create Upload Clicks Conversion Action",
+      description:
+        "Create an UPLOAD_CLICKS conversion action for offline conversions " +
+        "and enhanced conversions for leads. The action is created ENABLED " +
+        "unless status is provided.",
+      inputSchema: {
+        customerId: z.string().optional().describe("Google Ads customer ID."),
+        customer_id: z.string().optional().describe("Alias for customerId."),
+        name: z.string().min(1).describe("Conversion action name."),
+        category: z
+          .string()
+          .optional()
+          .describe("ConversionActionCategory enum. Default: IMPORTED_LEAD."),
+        status: z
+          .string()
+          .optional()
+          .describe("ConversionActionStatus enum. Default: ENABLED."),
+        includeInConversions: z
+          .boolean()
+          .optional()
+          .describe("Include in Conversions metric. Default: true."),
+        countingType: z
+          .string()
+          .optional()
+          .describe("ONE_PER_CLICK or MANY_PER_CLICK. Default: ONE_PER_CLICK."),
+        defaultValue: z
+          .number()
+          .finite()
+          .optional()
+          .describe("Optional default conversion value."),
+        currencyCode: z
+          .string()
+          .length(3)
+          .optional()
+          .describe("Default value currency code, e.g. USD."),
+        alwaysUseDefaultValue: z
+          .boolean()
+          .optional()
+          .describe("Default: false."),
+        validateOnly: z
+          .boolean()
+          .optional()
+          .describe("Validate against Google without creating. Default: false."),
+      },
+    },
+    async (params) => {
+      const customerId = requireCustomerId(params);
+      if (!customerId.ok) return customerId.error;
+
+      try {
+        const customer = getAdsClient(customerId.value);
+        const conversionAction = {
+          name: params.name,
+          type: enums.ConversionActionType.UPLOAD_CLICKS,
+          category: enumValue(
+            enums.ConversionActionCategory,
+            params.category ?? "IMPORTED_LEAD"
+          ),
+          status: enumValue(
+            enums.ConversionActionStatus,
+            params.status ?? "ENABLED"
+          ),
+          include_in_conversions_metric: params.includeInConversions ?? true,
+          counting_type: enumValue(
+            enums.ConversionActionCountingType,
+            params.countingType ?? "ONE_PER_CLICK"
+          ),
+          ...(params.defaultValue != null || params.currencyCode
+            ? {
+                value_settings: {
+                  default_value: params.defaultValue ?? 0,
+                  default_currency_code: params.currencyCode ?? "USD",
+                  always_use_default_value:
+                    params.alwaysUseDefaultValue ?? false,
+                },
+              }
+            : {}),
+        };
+
+        const result = await customer.conversionActions.create(
+          [conversionAction],
+          { validate_only: params.validateOnly ?? false }
+        );
+
+        if (params.validateOnly) {
+          return mcpText(
+            JSON.stringify(
+              {
+                validated: true,
+                conversion_action: conversionAction,
+              },
+              null,
+              2
+            )
+          );
+        }
+
+        return mcpText(
+          JSON.stringify(
+            {
+              resource_name: result.results?.[0]?.resource_name ?? null,
+              raw_result: result,
+            },
+            null,
+            2
+          )
+        );
+      } catch (err) {
+        return mcpError("creating conversion action", err);
+      }
+    }
+  );
+}
+
+function registerValidateOfflineConversionPayload(server: McpServer) {
+  server.registerTool(
+    "validate_offline_conversion_payload",
+    {
+      title: "Validate Offline Conversion Payload",
+      description:
+        "Perform local validation for Google Ads offline conversion / EC4L " +
+        "payloads. This does not call Google Ads.",
+      inputSchema: {
+        conversions: z
+          .array(clickConversionSchema)
+          .min(1)
+          .describe("Batch of conversion events to validate."),
+        conversionWindowDays: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Platform conversion window. Default: 90 days."),
+        now: z
+          .string()
+          .optional()
+          .describe("Optional ISO timestamp used as validation clock."),
+      },
+    },
+    async (params) => {
+      const validation = validateConversions(params.conversions, {
+        conversionWindowDays: params.conversionWindowDays,
+        now: params.now,
+      });
+      return mcpText(JSON.stringify(validation, null, 2));
+    }
+  );
+}
+
+function registerUploadClickConversions(server: McpServer) {
+  server.registerTool(
+    "upload_click_conversions",
+    {
+      title: "Upload Click Conversions",
+      description:
+        "Upload Google Ads offline click conversions / enhanced conversions " +
+        "for leads. partialFailure is always sent as true. Use validateOnly " +
+        "to ask Google to validate without executing.",
+      inputSchema: {
+        customerId: z
+          .string()
+          .optional()
+          .describe("Conversion customer ID, no hyphens."),
+        customer_id: z.string().optional().describe("Alias for customerId."),
+        conversions: z
+          .array(clickConversionSchema)
+          .min(1)
+          .describe("Batch of EC4L/offline conversion events."),
+        partialFailure: z
+          .boolean()
+          .optional()
+          .describe("Accepted for spec compatibility; the request always uses true."),
+        partial_failure: z
+          .boolean()
+          .optional()
+          .describe("Alias for partialFailure; the request always uses true."),
+        validateOnly: z
+          .boolean()
+          .optional()
+          .describe("If true, Google validates but does not execute."),
+        validate_only: z.boolean().optional().describe("Alias for validateOnly."),
+        jobId: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(2147483647)
+          .optional()
+          .describe("Optional job ID for diagnostics."),
+        job_id: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(2147483647)
+          .optional()
+          .describe("Alias for jobId."),
+        debugEnabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Ignored. debug_enabled was removed from current Google Ads API versions."
+          ),
+        conversionWindowDays: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Local validation conversion window. Default: 90 days."),
+      },
+    },
+    async (params) => {
+      const customerId = requireCustomerId(params);
+      if (!customerId.ok) return customerId.error;
+
+      const validation = validateConversions(params.conversions, {
+        conversionWindowDays: params.conversionWindowDays,
+      });
+      if (!validation.valid) {
+        return mcpJson(
+          {
+            ok: false,
+            phase: "local_validation",
+            ...validation,
+          },
+          true
+        );
+      }
+
+      const conversions = validation.normalized_conversions.map((conversion) =>
+        toGoogleClickConversion(conversion)
+      );
+      const validateOnly = params.validateOnly ?? params.validate_only ?? false;
+      const jobId = params.jobId ?? params.job_id;
+
+      try {
+        const customer = getAdsClient(customerId.value);
+        const request = new services.UploadClickConversionsRequest({
+          customer_id: customerId.value,
+          conversions,
+          partial_failure: true,
+          validate_only: validateOnly,
+          ...(jobId != null ? { job_id: jobId } : {}),
+        });
+
+        const response = await customer.conversionUploads.uploadClickConversions(
+          request
+        );
+        const decodedResponse = decodePartialFailure(customer, response);
+        const partialFailures = parseGoogleAdsFailure(
+          getPartialFailure(decodedResponse)
+        );
+
+        const warnings = [
+          ...validation.warnings,
+          ...partialFailures
+            .filter((failure) => failure.class === "warning/data")
+            .map((failure) => ({
+              index: failure.index ?? -1,
+              field: failure.fieldPath,
+              class: failure.class,
+              message: failure.message,
+            })),
+          ...(params.debugEnabled
+            ? [
+                {
+                  index: -1,
+                  field: "debugEnabled",
+                  class: "config" as ErrorClass,
+                  message:
+                    "debugEnabled was ignored because current Google Ads API versions do not support debug_enabled on UploadClickConversionsRequest.",
+                },
+              ]
+            : []),
+        ];
+
+        const hardFailures = partialFailures.filter(
+          (failure) => failure.class !== "warning/data"
+        );
+        const results = getResults(decodedResponse);
+
+        return mcpJson({
+          ok: hardFailures.length === 0,
+          validate_only: validateOnly,
+          partial_failure: true,
+          job_id: getJobId(decodedResponse),
+          received_count: validation.normalized_conversions.length,
+          result_count: results.length,
+          successful_result_count: countNonEmptyResults(results),
+          warning_count: warnings.length,
+          error_count: hardFailures.length,
+          warnings,
+          errors: hardFailures,
+          results,
+        });
+      } catch (err) {
+        const parsed = parseGoogleAdsFailure(err);
+        return mcpJson(
+          {
+            ok: false,
+            phase: "google_upload",
+            error_class: classifyThrownError(err, parsed),
+            message: formatError(err),
+            errors: parsed,
+          },
+          true
+        );
+      }
+    }
+  );
+}
+
+function registerGetOfflineConversionDiagnostics(server: McpServer) {
+  server.registerTool(
+    "get_offline_conversion_diagnostics",
+    {
+      title: "Get Offline Conversion Diagnostics",
+      description:
+        "Read Google Ads offline conversion upload diagnostics at client " +
+        "level and, optionally, conversion-action level.",
+      inputSchema: {
+        customerId: z.string().optional().describe("Google Ads customer ID."),
+        customer_id: z.string().optional().describe("Alias for customerId."),
+        conversionAction: z
+          .string()
+          .optional()
+          .describe(
+            "Optional conversion action resource name or numeric ID for action-level diagnostics."
+          ),
+        client: z
+          .string()
+          .optional()
+          .describe("Offline upload client enum. Default: GOOGLE_ADS_API."),
+      },
+    },
+    async (params) => {
+      const customerId = requireCustomerId(params);
+      if (!customerId.ok) return customerId.error;
+
+      try {
+        const client = sanitizeEnum(params.client ?? "GOOGLE_ADS_API");
+        const customer = getAdsClient(customerId.value);
+        const clientRows = await customer.query(
+          `SELECT
+             offline_conversion_upload_client_summary.resource_name,
+             offline_conversion_upload_client_summary.client,
+             offline_conversion_upload_client_summary.status,
+             offline_conversion_upload_client_summary.total_event_count,
+             offline_conversion_upload_client_summary.successful_event_count,
+             offline_conversion_upload_client_summary.pending_event_count,
+             offline_conversion_upload_client_summary.success_rate,
+             offline_conversion_upload_client_summary.pending_rate,
+             offline_conversion_upload_client_summary.last_upload_date_time,
+             offline_conversion_upload_client_summary.alerts,
+             offline_conversion_upload_client_summary.daily_summaries,
+             offline_conversion_upload_client_summary.job_summaries
+           FROM offline_conversion_upload_client_summary
+           WHERE offline_conversion_upload_client_summary.client = ${client}
+           LIMIT 10`
+        );
+
+        let conversionActionRows: unknown[] = [];
+        if (params.conversionAction) {
+          const conversionActionId =
+            parseConversionActionId(params.conversionAction) ??
+            params.conversionAction;
+          if (!/^\d+$/.test(conversionActionId)) {
+            throw new Error(
+              "conversionAction must be a resource name or numeric conversion action ID."
+            );
+          }
+
+          conversionActionRows = await customer.query(
+            `SELECT
+               offline_conversion_upload_conversion_action_summary.resource_name,
+               offline_conversion_upload_conversion_action_summary.client,
+               offline_conversion_upload_conversion_action_summary.conversion_action_id,
+               offline_conversion_upload_conversion_action_summary.conversion_action_name,
+               offline_conversion_upload_conversion_action_summary.status,
+               offline_conversion_upload_conversion_action_summary.total_event_count,
+               offline_conversion_upload_conversion_action_summary.successful_event_count,
+               offline_conversion_upload_conversion_action_summary.pending_event_count,
+               offline_conversion_upload_conversion_action_summary.last_upload_date_time,
+               offline_conversion_upload_conversion_action_summary.alerts,
+               offline_conversion_upload_conversion_action_summary.daily_summaries,
+               offline_conversion_upload_conversion_action_summary.job_summaries
+             FROM offline_conversion_upload_conversion_action_summary
+             WHERE offline_conversion_upload_conversion_action_summary.client = ${client}
+               AND offline_conversion_upload_conversion_action_summary.conversion_action_id = ${conversionActionId}
+             LIMIT 10`
+          );
+        }
+
+        return mcpText(
+          JSON.stringify(
+            {
+              client_summaries: clientRows,
+              conversion_action_summaries: conversionActionRows,
+            },
+            null,
+            2
+          )
+        );
+      } catch (err) {
+        return mcpError("fetching offline conversion diagnostics", err);
+      }
+    }
+  );
+}
+
+async function fetchConversionTrackingSetting(customerId: string) {
+  const customer = getAdsClient(customerId);
+  const rows = await customer.query<
+    {
+      customer: {
+        id?: number | string | null;
+        conversion_tracking_setting?: {
+          google_ads_conversion_customer?: string | null;
+          accepted_customer_data_terms?: boolean | null;
+          enhanced_conversions_for_leads_enabled?: boolean | null;
+          conversion_tracking_status?: string | number | null;
+          conversion_tracking_id?: number | string | null;
+          cross_account_conversion_tracking_id?: number | string | null;
+        } | null;
+      };
+    }[]
+  >(
+    `SELECT
+       customer.id,
+       customer.conversion_tracking_setting.google_ads_conversion_customer,
+       customer.conversion_tracking_setting.accepted_customer_data_terms,
+       customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled,
+       customer.conversion_tracking_setting.conversion_tracking_status,
+       customer.conversion_tracking_setting.conversion_tracking_id,
+       customer.conversion_tracking_setting.cross_account_conversion_tracking_id
+     FROM customer
+     LIMIT 1`
+  );
+
+  const row = rows[0]?.customer;
+  if (!row) {
+    throw new Error(`No customer row returned for customer ${customerId}`);
+  }
+
+  const setting = row.conversion_tracking_setting;
+  return {
+    customer_id: row.id != null ? String(row.id) : customerId,
+    conversion_customer_resource_name:
+      setting?.google_ads_conversion_customer ?? null,
+    conversion_customer_id:
+      parseCustomerId(setting?.google_ads_conversion_customer ?? null) ?? null,
+    customer_data_terms_accepted:
+      setting?.accepted_customer_data_terms ?? null,
+    enhanced_conversions_for_leads_enabled:
+      setting?.enhanced_conversions_for_leads_enabled ?? null,
+    conversion_tracking_status: normalizeEnumLabel(
+      setting?.conversion_tracking_status
+    ),
+    conversion_tracking_id:
+      setting?.conversion_tracking_id != null
+        ? String(setting.conversion_tracking_id)
+        : null,
+    cross_account_conversion_tracking_id:
+      setting?.cross_account_conversion_tracking_id != null
+        ? String(setting.cross_account_conversion_tracking_id)
+        : null,
+  };
+}
+
+function validateConversions(
+  rawConversions: RawClickConversion[],
+  options: { conversionWindowDays?: number; now?: string } = {}
+) {
+  const errors: ValidationIssue[] = [];
+  const warnings: ValidationIssue[] = [];
+  const normalized: NormalizedClickConversion[] = [];
+  const orderIds = new Set<string>();
+  const now = options.now ? new Date(options.now) : new Date();
+  const conversionWindowDays =
+    options.conversionWindowDays ?? DEFAULT_CONVERSION_WINDOW_DAYS;
+
+  if (Number.isNaN(now.getTime())) {
+    errors.push({
+      index: -1,
+      field: "now",
+      class: "data",
+      message: "`now` must be a valid ISO timestamp when provided.",
+    });
+  }
+
+  rawConversions.forEach((raw, index) => {
+    const conversion = normalizeInputConversion(raw);
+    normalized.push(conversion);
+
+    if (!conversion.conversionAction) {
+      errors.push({
+        index,
+        field: "conversionAction",
+        class: "config",
+        message: "conversionAction is required.",
+      });
+    } else if (!CONVERSION_ACTION_RE.test(conversion.conversionAction)) {
+      errors.push({
+        index,
+        field: "conversionAction",
+        class: "config",
+        message:
+          "conversionAction must look like customers/{customer_id}/conversionActions/{conversion_action_id}.",
+      });
+    }
+
+    if (!conversion.conversionDateTime) {
+      errors.push({
+        index,
+        field: "conversionDateTime",
+        class: "data",
+        message: "conversionDateTime is required.",
+      });
+    } else if (!GOOGLE_DATE_TIME_RE.test(conversion.conversionDateTime)) {
+      errors.push({
+        index,
+        field: "conversionDateTime",
+        class: "data",
+        message:
+          'Use Google Ads format "yyyy-mm-dd hh:mm:ss+|-hh:mm", for example "2026-06-24 09:15:00-07:00".',
+      });
+    } else {
+      const date = parseGoogleDateTime(conversion.conversionDateTime);
+      if (!date) {
+        errors.push({
+          index,
+          field: "conversionDateTime",
+          class: "data",
+          message: "conversionDateTime could not be parsed.",
+        });
+      } else if (!Number.isNaN(now.getTime())) {
+        const ageMs = now.getTime() - date.getTime();
+        const windowMs = conversionWindowDays * 24 * 60 * 60 * 1000;
+        if (ageMs < -5 * 60 * 1000) {
+          errors.push({
+            index,
+            field: "conversionDateTime",
+            class: "data",
+            message: "conversionDateTime is in the future.",
+          });
+        } else if (ageMs > windowMs) {
+          errors.push({
+            index,
+            field: "conversionDateTime",
+            class: "data",
+            message: `conversionDateTime is outside the ${conversionWindowDays}-day conversion window.`,
+          });
+        }
+      }
+    }
+
+    if (!conversion.orderId) {
+      errors.push({
+        index,
+        field: "orderId",
+        class: "data",
+        message: "orderId is required for event-level dedupe.",
+      });
+    } else {
+      const dedupeKey = `${conversion.conversionAction}|${conversion.orderId}`;
+      if (orderIds.has(dedupeKey)) {
+        errors.push({
+          index,
+          field: "orderId",
+          class: "duplicate",
+          message:
+            "Duplicate orderId in this batch for the same conversionAction.",
+        });
+      }
+      orderIds.add(dedupeKey);
+    }
+
+    if (!conversion.hashedEmail) {
+      errors.push({
+        index,
+        field: "hashedEmail",
+        class: "data",
+        message: "hashedEmail/emailSha256 is required for EC4L uploads.",
+      });
+    } else if (!SHA256_HEX_RE.test(conversion.hashedEmail)) {
+      if (SHA256_HEX_ANY_CASE_RE.test(conversion.hashedEmail)) {
+        warnings.push({
+          index,
+          field: "hashedEmail",
+          class: "data",
+          message: "hashedEmail was normalized to lowercase SHA-256 hex.",
+        });
+        conversion.hashedEmail = conversion.hashedEmail.toLowerCase();
+      } else {
+        errors.push({
+          index,
+          field: "hashedEmail",
+          class: "data",
+          message:
+            "hashedEmail must be a 64-character SHA-256 hex digest, not a raw email.",
+        });
+      }
+    }
+
+    const clickIds = ["gclid", "gbraid", "wbraid"].filter(
+      (field) => !!conversion[field as "gclid" | "gbraid" | "wbraid"]
+    );
+    if (clickIds.length > 1) {
+      errors.push({
+        index,
+        field: clickIds.join(","),
+        class: "data",
+        message: "Provide at most one click ID: gclid, gbraid, or wbraid.",
+      });
+    } else if (clickIds.length === 0) {
+      warnings.push({
+        index,
+        field: "gclid/gbraid/wbraid",
+        class: "warning/data",
+        message:
+          "No click ID provided. This is valid for EC4L/email-only rows, but Google may surface CLICK_NOT_FOUND-style diagnostics for non-Google traffic.",
+      });
+    }
+
+    for (const field of clickIds) {
+      const value = conversion[field as "gclid" | "gbraid" | "wbraid"];
+      if (value && /\s/.test(value)) {
+        errors.push({
+          index,
+          field,
+          class: "data",
+          message: `${field} must not contain whitespace.`,
+        });
+      }
+    }
+
+    if (
+      conversion.currencyCode &&
+      !/^[A-Z]{3}$/.test(conversion.currencyCode)
+    ) {
+      errors.push({
+        index,
+        field: "currencyCode",
+        class: "data",
+        message: "currencyCode must be an uppercase ISO 4217 code like USD.",
+      });
+    }
+
+    if (
+      conversion.conversionValue != null &&
+      conversion.conversionValue < 0
+    ) {
+      errors.push({
+        index,
+        field: "conversionValue",
+        class: "data",
+        message: "conversionValue must be non-negative.",
+      });
+    }
+  });
+
+  return {
+    valid: errors.length === 0,
+    conversion_window_days: conversionWindowDays,
+    checked_count: rawConversions.length,
+    error_count: errors.length,
+    warning_count: warnings.length,
+    errors,
+    warnings,
+    normalized_conversions: normalized,
+  };
+}
+
+function normalizeInputConversion(raw: RawClickConversion) {
+  return {
+    conversionAction: (raw.conversionAction ?? raw.conversion_action ?? "").trim(),
+    conversionDateTime: (
+      raw.conversionDateTime ??
+      raw.conversion_date_time ??
+      ""
+    ).trim(),
+    orderId: (raw.orderId ?? raw.order_id ?? "").trim(),
+    hashedEmail: (
+      raw.hashedEmail ??
+      raw.hashed_email ??
+      raw.emailSha256 ??
+      raw.email_sha256 ??
+      ""
+    ).trim(),
+    gclid: trimOptional(raw.gclid),
+    gbraid: trimOptional(raw.gbraid),
+    wbraid: trimOptional(raw.wbraid),
+    currencyCode: trimOptional(raw.currencyCode ?? raw.currency_code),
+    conversionValue: raw.conversionValue ?? raw.conversion_value,
+    consent: raw.consent,
+    conversionEnvironment:
+      raw.conversionEnvironment ?? raw.conversion_environment,
+    customerType: raw.customerType ?? raw.customer_type,
+  };
+}
+
+function toGoogleClickConversion(conversion: NormalizedClickConversion) {
+  return {
+    conversion_action: conversion.conversionAction,
+    conversion_date_time: conversion.conversionDateTime,
+    order_id: conversion.orderId,
+    user_identifiers: [{ hashed_email: conversion.hashedEmail }],
+    ...(conversion.gclid ? { gclid: conversion.gclid } : {}),
+    ...(conversion.gbraid ? { gbraid: conversion.gbraid } : {}),
+    ...(conversion.wbraid ? { wbraid: conversion.wbraid } : {}),
+    ...(conversion.currencyCode ? { currency_code: conversion.currencyCode } : {}),
+    ...(conversion.conversionValue != null
+      ? { conversion_value: conversion.conversionValue }
+      : {}),
+    ...(conversion.consent
+      ? {
+          consent: {
+            ...(conversion.consent.adUserData
+              ? {
+                  ad_user_data: enumValue(
+                    enums.ConsentStatus,
+                    conversion.consent.adUserData
+                  ),
+                }
+              : {}),
+            ...(conversion.consent.adPersonalization
+              ? {
+                  ad_personalization: enumValue(
+                    enums.ConsentStatus,
+                    conversion.consent.adPersonalization
+                  ),
+                }
+              : {}),
+          },
+        }
+      : {}),
+    ...(conversion.conversionEnvironment
+      ? {
+          conversion_environment: enumValue(
+            enums.ConversionEnvironment,
+            conversion.conversionEnvironment
+          ),
+        }
+      : {}),
+    ...(conversion.customerType
+      ? {
+          customer_type: enumValue(
+            enums.ConversionCustomerType,
+            conversion.customerType
+          ),
+        }
+      : {}),
+  };
+}
+
+function decodePartialFailure(
+  customer: ReturnType<typeof getAdsClient>,
+  response: unknown
+) {
+  const decoder = customer as unknown as {
+    decodePartialFailureError?: (response: unknown) => unknown;
+  };
+  return decoder.decodePartialFailureError
+    ? decoder.decodePartialFailureError(response)
+    : response;
+}
+
+function parseGoogleAdsFailure(value: unknown): ParsedGoogleAdsError[] {
+  const failure = extractGoogleAdsFailure(value);
+  if (!failure?.errors?.length) return [];
+
+  return failure.errors.map((error) => {
+    const codeInfo = extractCodeInfo(error);
+    const fieldPath = formatFieldPath(error);
+    const message = error.message ?? "(no message)";
+    return {
+      index: extractRowIndex(error),
+      codeCategory: codeInfo.category,
+      code: codeInfo.code,
+      class: classifyGoogleAdsError(codeInfo.category, codeInfo.code, message),
+      message,
+      fieldPath,
+    };
+  });
+}
+
+function extractGoogleAdsFailure(value: unknown): GoogleAdsFailureLike | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  if (Array.isArray(candidate.errors)) {
+    return candidate as GoogleAdsFailureLike;
+  }
+
+  const partial =
+    candidate.partial_failure_error ?? candidate.partialFailureError;
+  if (partial && typeof partial === "object") {
+    const partialCandidate = partial as Record<string, unknown>;
+    if (Array.isArray(partialCandidate.errors)) {
+      return partialCandidate as GoogleAdsFailureLike;
+    }
+  }
+
+  return null;
+}
+
+function getPartialFailure(response: unknown) {
+  if (!response || typeof response !== "object") return undefined;
+  const object = response as Record<string, unknown>;
+  return object.partial_failure_error ?? object.partialFailureError;
+}
+
+function getResults(response: unknown): unknown[] {
+  if (!response || typeof response !== "object") return [];
+  const results = (response as Record<string, unknown>).results;
+  return Array.isArray(results) ? results : [];
+}
+
+function getJobId(response: unknown): string | number | null {
+  if (!response || typeof response !== "object") return null;
+  const object = response as Record<string, unknown>;
+  const jobId = object.job_id ?? object.jobId;
+  return typeof jobId === "string" || typeof jobId === "number" ? jobId : null;
+}
+
+function extractCodeInfo(error: GoogleAdsErrorLike) {
+  const errorCode = error.error_code ?? error.errorCode ?? {};
+  const entry = Object.entries(errorCode).find(([, value]) => value != null);
+  if (!entry) return { category: null, code: null };
+  const [category, code] = entry;
+  return {
+    category,
+    code: code != null ? String(code) : null,
+  };
+}
+
+function formatFieldPath(error: GoogleAdsErrorLike) {
+  const elements =
+    error.location?.field_path_elements ??
+    error.location?.fieldPathElements ??
+    [];
+  return elements
+    .map((element) => {
+      const field = element.field_name ?? element.fieldName ?? "?";
+      return element.index != null ? `${field}[${element.index}]` : field;
+    })
+    .join(".");
+}
+
+function extractRowIndex(error: GoogleAdsErrorLike) {
+  const elements =
+    error.location?.field_path_elements ??
+    error.location?.fieldPathElements ??
+    [];
+  for (const element of elements) {
+    const field = element.field_name ?? element.fieldName;
+    if (
+      (field === "conversions" || field === "operations") &&
+      element.index != null
+    ) {
+      return Number(element.index);
+    }
+  }
+  const indexed = elements.find((element) => element.index != null);
+  return indexed?.index != null ? Number(indexed.index) : null;
+}
+
+function classifyGoogleAdsError(
+  category: string | null,
+  code: string | null,
+  message: string
+): ErrorClass {
+  const combined = `${category ?? ""}:${code ?? ""}:${message}`.toUpperCase();
+
+  if (combined.includes("CLICK_NOT_FOUND")) return "warning/data";
+  if (combined.includes("DUPLICATE_ORDER_ID")) return "duplicate";
+  if (
+    combined.includes("INVALID_CONVERSION_ACTION_TYPE") ||
+    combined.includes("CONVERSION_ACTION_NOT_FOUND") ||
+    combined.includes("NO CONVERSION ACTION") ||
+    (combined.includes("RESOURCE_NOT_FOUND") &&
+      combined.includes("CONVERSION"))
+  ) {
+    return "config";
+  }
+  if (
+    combined.includes("CUSTOMER_NOT_ENABLED_ENHANCED_CONVERSIONS_FOR_LEADS") ||
+    combined.includes("CUSTOMER_NOT_ACCEPTED_CUSTOMER_DATA_TERMS") ||
+    combined.includes("CUSTOMER_NOT_ENABLED")
+  ) {
+    return "config";
+  }
+  if (
+    combined.includes("AUTHENTICATION") ||
+    combined.includes("AUTHORIZATION") ||
+    combined.includes("PERMISSION") ||
+    combined.includes("ACCESS_DENIED") ||
+    combined.includes("DEVELOPER_TOKEN")
+  ) {
+    return "config/auth";
+  }
+  if (
+    combined.includes("QUOTA") ||
+    combined.includes("RATE") ||
+    combined.includes("RESOURCE_EXHAUSTED") ||
+    combined.includes("TRANSIENT") ||
+    combined.includes("DEADLINE") ||
+    combined.includes("INTERNAL_ERROR") ||
+    combined.includes("UNAVAILABLE")
+  ) {
+    return "retryable";
+  }
+  if (
+    combined.includes("USER_IDENTIFIER") ||
+    combined.includes("HASH") ||
+    combined.includes("EMAIL") ||
+    combined.includes("DATE") ||
+    combined.includes("TIME") ||
+    combined.includes("TOO_RECENT") ||
+    combined.includes("TOO_OLD") ||
+    combined.includes("INVALID_VALUE")
+  ) {
+    return "data";
+  }
+
+  return "unknown";
+}
+
+function classifyThrownError(
+  err: unknown,
+  parsed: ParsedGoogleAdsError[]
+): ErrorClass {
+  const parsedClass = parsed.find((error) => error.class !== "unknown")?.class;
+  if (parsedClass) return parsedClass;
+
+  if (err && typeof err === "object") {
+    const code = String((err as { code?: unknown }).code ?? "");
+    if (["8", "13", "14"].includes(code)) return "retryable";
+    if (["7", "16"].includes(code)) return "config/auth";
+  }
+
+  const message = formatError(err).toUpperCase();
+  if (message.includes("5XX") || message.includes("UNAVAILABLE")) {
+    return "retryable";
+  }
+  if (message.includes("PERMISSION") || message.includes("AUTH")) {
+    return "config/auth";
+  }
+  return "unknown";
+}
+
+function countNonEmptyResults(results: unknown[]) {
+  return results.filter((result) => {
+    if (!result || typeof result !== "object") return false;
+    return Object.keys(result as Record<string, unknown>).length > 0;
+  }).length;
+}
+
+function requireCustomerId(params: { customerId?: string; customer_id?: string }):
+  | { ok: true; value: string }
+  | { ok: false; error: ReturnType<typeof mcpError> } {
+  const value = (params.customerId ?? params.customer_id ?? "").trim();
+  if (!value) {
+    return {
+      ok: false,
+      error: mcpError(
+        "validating customer ID",
+        new Error("customerId is required.")
+      ),
+    };
+  }
+  if (!CUSTOMER_ID_RE.test(value)) {
+    return {
+      ok: false,
+      error: mcpError(
+        "validating customer ID",
+        new Error("customerId must be digits only, with no hyphens.")
+      ),
+    };
+  }
+  return { ok: true, value };
+}
+
+function sanitizeEnum(value: string) {
+  const enumValueString = value.trim().toUpperCase();
+  if (!ENUM_RE.test(enumValueString)) {
+    throw new Error(`Invalid enum value: ${value}`);
+  }
+  return enumValueString;
+}
+
+function enumValue<T extends Record<string, string | number>>(
+  enumObject: T,
+  value: string
+) {
+  const key = sanitizeEnum(value);
+  const matched = enumObject[key];
+  if (matched == null || typeof matched === "string") {
+    throw new Error(`Unsupported enum value: ${value}`);
+  }
+  return matched;
+}
+
+function normalizeEnumLabel(value: string | number | null | undefined) {
+  return value == null ? null : String(value);
+}
+
+function parseCustomerId(resourceName: string | null) {
+  if (!resourceName) return null;
+  const match = /^customers\/(\d+)$/.exec(resourceName);
+  return match?.[1] ?? null;
+}
+
+function parseConversionActionId(value: string) {
+  const match = CONVERSION_ACTION_RE.exec(value.trim());
+  return match?.[2] ?? null;
+}
+
+function parseGoogleDateTime(value: string) {
+  const parsed = new Date(value.replace(" ", "T"));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function trimOptional(value: string | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function mcpJson(value: unknown, isError = false) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
