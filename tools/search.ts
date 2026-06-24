@@ -9,6 +9,75 @@ export function registerSearchTools(server: McpServer) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Shared GAQL inputs + query builder
+//
+// Extracted so `search` and `search_to_artifact` (tools/search-artifact.ts)
+// stay in lockstep: identical inputs, identical GAQL construction, identical
+// Google Ads API call. Editing the query semantics here affects BOTH tools —
+// keep that intentional. `search`'s externally-visible schema and output are
+// unchanged by this extraction.
+// ──────────────────────────────────────────────────────────────────────
+
+/** Zod input shape shared by `search` and `search_to_artifact`. */
+export const gaqlInputShape = {
+  customer_id: z
+    .string()
+    .describe("Google Ads customer ID, no hyphens (e.g. '9232939339')"),
+  fields: z
+    .array(z.string())
+    .describe("Fields to SELECT, e.g. ['campaign.name', 'metrics.impressions']"),
+  resource: z
+    .string()
+    .describe(
+      "Resource to query FROM, e.g. 'campaign', 'ad_group', 'keyword_view'"
+    ),
+  conditions: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Optional WHERE conditions, e.g. ['campaign.status = ENABLED', " +
+        "'metrics.impressions > 0']. Combined with AND."
+    ),
+  orderings: z
+    .array(z.string())
+    .optional()
+    .describe("Optional ORDER BY clauses, e.g. ['metrics.impressions DESC']"),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Optional maximum number of rows to return"),
+};
+
+export type GaqlQueryParams = {
+  fields: string[];
+  resource: string;
+  conditions?: string[];
+  orderings?: string[];
+  limit?: number;
+};
+
+/** Build a GAQL query string from structured inputs (SELECT/FROM/WHERE/ORDER BY/LIMIT). */
+export function buildGaqlQuery(params: GaqlQueryParams): string {
+  let query = `SELECT ${params.fields.join(", ")} FROM ${params.resource}`;
+
+  if (params.conditions && params.conditions.length > 0) {
+    query += ` WHERE ${params.conditions.join(" AND ")}`;
+  }
+
+  if (params.orderings && params.orderings.length > 0) {
+    query += ` ORDER BY ${params.orderings.join(", ")}`;
+  }
+
+  if (params.limit) {
+    query += ` LIMIT ${params.limit}`;
+  }
+
+  return query;
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // search — run an arbitrary GAQL query against a customer account
 //
 // This mirrors the `search` tool from the official Google Ads MCP
@@ -29,60 +98,12 @@ function registerSearch(server: McpServer) {
         "limit. Returns the raw result rows as JSON. Use this for any " +
         "read operation: campaign metrics, ad group performance, keyword " +
         "data, search terms, asset views, etc.",
-      inputSchema: {
-        customer_id: z
-          .string()
-          .describe("Google Ads customer ID, no hyphens (e.g. '9232939339')"),
-        fields: z
-          .array(z.string())
-          .describe(
-            "Fields to SELECT, e.g. ['campaign.name', 'metrics.impressions']"
-          ),
-        resource: z
-          .string()
-          .describe(
-            "Resource to query FROM, e.g. 'campaign', 'ad_group', 'keyword_view'"
-          ),
-        conditions: z
-          .array(z.string())
-          .optional()
-          .describe(
-            "Optional WHERE conditions, e.g. ['campaign.status = ENABLED', " +
-              "'metrics.impressions > 0']. Combined with AND."
-          ),
-        orderings: z
-          .array(z.string())
-          .optional()
-          .describe(
-            "Optional ORDER BY clauses, e.g. ['metrics.impressions DESC']"
-          ),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("Optional maximum number of rows to return"),
-      },
+      inputSchema: gaqlInputShape,
     },
     async (params) => {
       try {
         const customer = getAdsClient(params.customer_id);
-
-        // Build GAQL query
-        let query = `SELECT ${params.fields.join(", ")} FROM ${params.resource}`;
-
-        if (params.conditions && params.conditions.length > 0) {
-          query += ` WHERE ${params.conditions.join(" AND ")}`;
-        }
-
-        if (params.orderings && params.orderings.length > 0) {
-          query += ` ORDER BY ${params.orderings.join(", ")}`;
-        }
-
-        if (params.limit) {
-          query += ` LIMIT ${params.limit}`;
-        }
-
+        const query = buildGaqlQuery(params);
         const rows = await customer.query(query);
         return mcpText(JSON.stringify(rows, null, 2));
       } catch (err) {
