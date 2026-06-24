@@ -19,7 +19,6 @@ The MCP endpoint is served at `/api/[transport]` and protected by `withMcpAuth`.
 |------|-------------|
 | `list_accessible_customers` | List Google Ads accounts the configured identity can access |
 | `search` | Run a GAQL (Google Ads Query Language) query — the general read tool |
-| `search_to_artifact` | Run a GAQL read query and return only metadata; the full result rows are stored as a JSON artifact for later download (use for large result sets to keep rows out of the agent context) |
 | `get_ad` | Fetch details for a specific ad |
 | `create_campaign` | Create a campaign (with budget) |
 | `create_ad_group` | Create an ad group under a campaign |
@@ -38,7 +37,6 @@ The MCP endpoint is served at `/api/[transport]` and protected by `withMcpAuth`.
 - **Next.js 16** (App Router) on **React 19**
 - [`mcp-handler`](https://www.npmjs.com/package/mcp-handler) + [`@modelcontextprotocol/sdk`](https://www.npmjs.com/package/@modelcontextprotocol/sdk)
 - [`google-ads-api`](https://www.npmjs.com/package/google-ads-api) v23 (Ads API client)
-- [`@vercel/blob`](https://www.npmjs.com/package/@vercel/blob) for durable `search_to_artifact` storage
 - `google-auth-library` + `jose` for OAuth and JWT
 - `zod` for tool input validation
 
@@ -68,54 +66,6 @@ cp .env.local.example .env.local
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth client, reused for minting + runtime sign-in |
 | `JWT_SECRET` | Signs the MCP auth JWT — generate with `openssl rand -hex 32` |
 | `ALLOWED_DOMAIN` | (Optional) restrict sign-in to one Workspace domain |
-| `BLOB_READ_WRITE_TOKEN` | (Production) Vercel Blob read/write token. Enables durable artifact storage for `search_to_artifact`. Auto-injected when a Blob store is linked to the Vercel project; set manually for local testing against a real store |
-| `ARTIFACT_BACKEND` | (Optional) force the artifact backend: `vercel_blob` or `filesystem`. Default: `vercel_blob` when `BLOB_READ_WRITE_TOKEN` is set, otherwise `filesystem` |
-| `ARTIFACT_DIR` | (Optional) directory for the **filesystem** backend. Defaults to `<os.tmpdir()>/google-ads-mcp-artifacts` |
-| `ARTIFACT_BLOB_ACCESS` | (Optional) `private` (default) or `public` for stored blobs. Leave as `private` unless your Blob store lacks private access |
-
-### Artifact storage (`search_to_artifact`)
-
-`search_to_artifact` runs a GAQL read query but, instead of returning the rows inline, serialises them to a JSON array, stores the bytes, and returns **metadata only** (id, size, sha256, row count) plus a short-lived signed `download_url`. This keeps large result sets out of the agent's context window.
-
-Two backends, selected by `ARTIFACT_BACKEND` (or auto-detected):
-
-- **`vercel_blob` (production).** Stores **private** blobs on [Vercel Blob](https://vercel.com/docs/storage/vercel-blob). Durable and the correct choice for the deployed serverless app. Link a Blob store to the project (`vercel blob` / dashboard) so `BLOB_READ_WRITE_TOKEN` is available.
-- **`filesystem` (local/dev).** Writes under `ARTIFACT_DIR`. **Not durable in production** — on Vercel only `/tmp` is writable and it is ephemeral and per-instance, so an artifact written by one request may be gone from the next. Use it only for local development and smoke tests.
-
-Bytes are retrieved via `GET /api/artifacts/:id?token=…`, which streams the raw artifact as an attachment (never JSON through an MCP response, so rows don't re-enter the agent context). The `token` is a short-lived (15 min) HMAC signed with `JWT_SECRET`; the blob itself stays private. There is intentionally **no `get_artifact` MCP tool** — that would recreate the context-bloat problem.
-
-Example `search_to_artifact` response (metadata only):
-
-```json
-{
-  "status": "ok",
-  "artifact": {
-    "id": "art_3f8c2a1b9d7e4c6a8b2f1e0d5a4c7b90",
-    "name": "search-art_3f8c2a1b9d7e4c6a8b2f1e0d5a4c7b90.json",
-    "mime_type": "application/json",
-    "compression": "none",
-    "byte_size": 9795,
-    "sha256": "36e03f5ce029…",
-    "row_count": 50,
-    "download_url": "https://<deployment>/api/artifacts/art_3f8c2a1b…?token=1750800000.AbC…"
-  },
-  "query": {
-    "customer_id": "9232939339",
-    "resource": "campaign",
-    "fields": ["campaign.id", "campaign.name", "campaign.status"],
-    "conditions": null,
-    "orderings": null,
-    "limit": 50
-  }
-}
-```
-
-Download the full rows later (checksum verifiable against `artifact.sha256`):
-
-```bash
-curl -L "$DOWNLOAD_URL" -o rows.json
-shasum -a 256 rows.json   # matches artifact.sha256
-```
 
 See `.env.local.example` for full notes, including how to mint the refresh token.
 

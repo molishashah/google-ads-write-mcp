@@ -9,7 +9,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.26.0",
-    "@vercel/blob": "^2.4.1",
     "google-ads-api": "^23.0.0",
     "google-auth-library": "^10.6.2",
     "jose": "^6.2.2",
