@@ -2,6 +2,29 @@ export function mcpText(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
 
+export type McpJsonEnvelope = {
+  ok: boolean;
+  tool: string;
+  customer_id?: string;
+  validate_only?: boolean;
+  resource_names?: string[];
+  results?: unknown;
+  warnings?: string[];
+  errors?: string[];
+  request_id?: string;
+};
+
+export function mcpJson(envelope: McpJsonEnvelope, isError = false) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(envelope, null, 2) }],
+    ...(isError ? { isError: true as const } : {}),
+  };
+}
+
+export function mcpSuccess(envelope: Omit<McpJsonEnvelope, "ok">) {
+  return mcpJson({ ok: true, ...envelope });
+}
+
 /**
  * Format any thrown value into a human-readable error message.
  *
@@ -63,4 +86,35 @@ export function mcpError(label: string, err: unknown) {
     ],
     isError: true,
   };
+}
+
+export function mcpJsonError(
+  tool: string,
+  err: unknown,
+  context: {
+    customer_id?: string;
+    validate_only?: boolean;
+    warnings?: string[];
+  } = {}
+) {
+  return mcpJson(
+    {
+      ok: false,
+      tool,
+      customer_id: context.customer_id,
+      validate_only: context.validate_only,
+      warnings: context.warnings,
+      errors: [formatError(err)],
+      request_id: extractErrorRequestId(err),
+    },
+    true
+  );
+}
+
+function extractErrorRequestId(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const obj = err as { request_id?: unknown; requestId?: unknown };
+  if (typeof obj.request_id === "string") return obj.request_id;
+  if (typeof obj.requestId === "string") return obj.requestId;
+  return undefined;
 }

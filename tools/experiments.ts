@@ -2,7 +2,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { enums, services } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
-import { mcpText, mcpError } from "@/lib/mcp-helpers";
+import { extractRequestId, extractResourceNames } from "@/lib/google-ads-utils";
+import { mcpJsonError, mcpSuccess, mcpText, mcpError } from "@/lib/mcp-helpers";
+import { jsonRecordSchema, mutateOptionSchema, registerCollectionMutateTool } from "@/tools/tool-utils";
 
 // ──────────────────────────────────────────────────────────────────────
 // Ad Variation experiment tools
@@ -10,9 +12,9 @@ import { mcpText, mcpError } from "@/lib/mcp-helpers";
 // Divergence from the PRD
 // -----------------------
 // The PRD's example code was written against a simplified API that
-// doesn't match google-ads-api v23: no `experiments.mutate({operations})`,
+// doesn't match the generated google-ads-api client: no `experiments.mutate({operations})`,
 // no `trafficSplitPercent` on Experiment, no boolean `inDesign` on
-// ExperimentArm, camelCase vs snake_case, etc. What IS real in v23:
+// ExperimentArm, camelCase vs snake_case, etc. What IS real in the generated client:
 //
 //   1. experiments.create([{name, type=AD_VARIATION, status=SETUP, suffix}])
 //   2. experimentArms.create([control, treatment], response_content_type=
@@ -34,6 +36,132 @@ export function registerExperimentTools(server: McpServer) {
   registerCreateAdVariation(server);
   registerGetExperimentStatus(server);
   registerGraduateExperiment(server);
+  registerExperimentAdminTools(server);
+}
+
+function registerExperimentAdminTools(server: McpServer) {
+  server.registerTool(
+    "list_experiments",
+    {
+      title: "List Experiments",
+      description: "List experiments and lifecycle metadata.",
+      inputSchema: {
+        customer_id: z.string(),
+        limit: z.number().int().positive().max(10000).optional(),
+      },
+    },
+    async (params) => {
+      const tool = "list_experiments";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const query = `
+          SELECT
+            experiment.resource_name,
+            experiment.id,
+            experiment.name,
+            experiment.type,
+            experiment.status,
+            experiment.start_date,
+            experiment.end_date,
+            experiment.suffix
+          FROM experiment
+          ORDER BY experiment.id DESC
+          LIMIT ${params.limit ?? 1000}`;
+        const rows = await customer.query(query);
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          results: { query, rows },
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+
+  registerExperimentRpcTool(
+    server,
+    "schedule_experiment",
+    "scheduleExperiment",
+    "Schedule an experiment."
+  );
+  registerExperimentRpcTool(
+    server,
+    "end_experiment",
+    "endExperiment",
+    "End an experiment."
+  );
+  registerExperimentRpcTool(
+    server,
+    "promote_experiment",
+    "promoteExperiment",
+    "Promote an experiment."
+  );
+  registerExperimentRpcTool(
+    server,
+    "list_experiment_async_errors",
+    "listExperimentAsyncErrors",
+    "List asynchronous experiment errors."
+  );
+  registerCollectionMutateTool({
+    server,
+    name: "remove_experiment",
+    title: "Remove Experiment",
+    description: "Irreversibly remove experiments.",
+    collection: "experiments",
+    action: "remove",
+    resourceLabel: "Experiment",
+  });
+  registerCollectionMutateTool({
+    server,
+    name: "update_experiment",
+    title: "Update Experiment",
+    description: "Update raw experiment fields.",
+    collection: "experiments",
+    action: "update",
+    resourceLabel: "Experiment",
+  });
+}
+
+function registerExperimentRpcTool(
+  server: McpServer,
+  toolName: string,
+  methodName:
+    | "scheduleExperiment"
+    | "endExperiment"
+    | "promoteExperiment"
+    | "listExperimentAsyncErrors",
+  description: string
+) {
+  server.registerTool(
+    toolName,
+    {
+      title: toolName
+        .split("_")
+        .map((part) => part[0].toUpperCase() + part.slice(1))
+        .join(" "),
+      description,
+      inputSchema: {
+        customer_id: z.string(),
+        request: jsonRecordSchema.describe("Raw ExperimentService request object."),
+      },
+    },
+    async (params) => {
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.experiments[methodName](params.request as never);
+        return mcpSuccess({
+          tool: toolName,
+          customer_id: params.customer_id,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(toolName, err, { customer_id: params.customer_id });
+      }
+    }
+  );
 }
 
 // ── create_ad_variation ──────────────────────────────────────────────
@@ -666,5 +794,3 @@ async function createAdVariation(params: CreateAdVariationParams) {
     return mcpError("creating ad variation", err);
   }
 }
-
-
