@@ -3,6 +3,7 @@ import { enums, ResourceNames, services } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
 import {
+  customerScopedConstant,
   escapeGaql,
   extractRequestId,
   extractResourceNames,
@@ -74,6 +75,15 @@ const CONVERSION_ACTION_TYPES = [
   "GOOGLE_HOSTED",
   "LEAD_FORM_SUBMIT",
 ] as const;
+const CONVERSION_CUSTOM_VARIABLE_STATUSES = [
+  "ACTIVATION_NEEDED",
+  "ENABLED",
+  "PAUSED",
+] as const;
+const CONVERSION_VALUE_RULE_STATUSES = ["ENABLED", "PAUSED", "REMOVED"] as const;
+const VALUE_RULE_OPERATIONS = ["ADD", "MULTIPLY", "SET"] as const;
+const VALUE_RULE_DEVICE_TYPES = ["MOBILE", "DESKTOP", "TABLET"] as const;
+const VALUE_RULE_GEO_MATCH_TYPES = ["ANY", "LOCATION_OF_PRESENCE"] as const;
 
 type ErrorClass =
   | "config"
@@ -147,6 +157,28 @@ export type ConversionActionSetupInput = {
   always_use_default_value?: boolean;
   click_through_lookback_window_days?: number;
   view_through_lookback_window_days?: number;
+  fields?: Record<string, unknown>;
+};
+
+export type ConversionCustomVariableInput = {
+  name: string;
+  tag?: string;
+  status?: (typeof CONVERSION_CUSTOM_VARIABLE_STATUSES)[number];
+  fields?: Record<string, unknown>;
+};
+
+export type ConversionValueRuleInput = {
+  customer_id: string;
+  operation: (typeof VALUE_RULE_OPERATIONS)[number];
+  value: number;
+  status?: (typeof CONVERSION_VALUE_RULE_STATUSES)[number];
+  geo_target_constant_ids?: string[];
+  excluded_geo_target_constant_ids?: string[];
+  geo_match_type?: (typeof VALUE_RULE_GEO_MATCH_TYPES)[number];
+  excluded_geo_match_type?: (typeof VALUE_RULE_GEO_MATCH_TYPES)[number];
+  device_types?: Array<(typeof VALUE_RULE_DEVICE_TYPES)[number]>;
+  user_list_ids?: string[];
+  user_interest_ids?: string[];
   fields?: Record<string, unknown>;
 };
 
@@ -911,15 +943,7 @@ export function buildCampaignConversionGoalResourceName(
 }
 
 function registerConversionValueTools(server: McpServer) {
-  registerCollectionMutateTool({
-    server,
-    name: "create_conversion_custom_variable",
-    title: "Create Conversion Custom Variable",
-    description: "Create conversion custom variables.",
-    collection: "conversionCustomVariables",
-    action: "create",
-    resourceLabel: "Conversion custom variable",
-  });
+  registerCreateConversionCustomVariable(server);
   registerCollectionMutateTool({
     server,
     name: "update_conversion_custom_variable",
@@ -929,15 +953,7 @@ function registerConversionValueTools(server: McpServer) {
     action: "update",
     resourceLabel: "Conversion custom variable",
   });
-  registerCollectionMutateTool({
-    server,
-    name: "create_conversion_value_rule",
-    title: "Create Conversion Value Rule",
-    description: "Create conversion value rules.",
-    collection: "conversionValueRules",
-    action: "create",
-    resourceLabel: "Conversion value rule",
-  });
+  registerCreateConversionValueRule(server);
   registerCollectionMutateTool({
     server,
     name: "update_conversion_value_rule",
@@ -956,6 +972,223 @@ function registerConversionValueTools(server: McpServer) {
     action: "remove",
     resourceLabel: "Conversion value rule",
   });
+}
+
+function registerCreateConversionCustomVariable(server: McpServer) {
+  server.registerTool(
+    "create_conversion_custom_variable",
+    {
+      title: "Create Conversion Custom Variable",
+      description:
+        "Create a conversion custom variable from typed fields. Use mutate_google_ads_resources for raw create payloads.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        tag: z.string().optional(),
+        status: z.enum(CONVERSION_CUSTOM_VARIABLE_STATUSES).optional(),
+        fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_conversion_custom_variable";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resource = buildConversionCustomVariableResource(params);
+        const result = await customer.conversionCustomVariables.create(
+          [resource] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: {
+            conversion_custom_variable: resource,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildConversionCustomVariableResource(
+  params: ConversionCustomVariableInput
+) {
+  return {
+    name: params.name,
+    ...(params.tag ? { tag: params.tag } : {}),
+    ...(params.status
+      ? {
+          status: enumValue(
+            enums.ConversionCustomVariableStatus,
+            params.status
+          ),
+        }
+      : {}),
+    ...(params.fields ?? {}),
+  };
+}
+
+function registerCreateConversionValueRule(server: McpServer) {
+  server.registerTool(
+    "create_conversion_value_rule",
+    {
+      title: "Create Conversion Value Rule",
+      description:
+        "Create a conversion value rule with typed action and common geo/device/audience conditions.",
+      inputSchema: {
+        customer_id: z.string(),
+        operation: z.enum(VALUE_RULE_OPERATIONS),
+        value: z.number().finite(),
+        status: z.enum(CONVERSION_VALUE_RULE_STATUSES).optional(),
+        geo_target_constant_ids: z.array(z.string()).optional(),
+        excluded_geo_target_constant_ids: z.array(z.string()).optional(),
+        geo_match_type: z.enum(VALUE_RULE_GEO_MATCH_TYPES).optional(),
+        excluded_geo_match_type: z.enum(VALUE_RULE_GEO_MATCH_TYPES).optional(),
+        device_types: z.array(z.enum(VALUE_RULE_DEVICE_TYPES)).optional(),
+        user_list_ids: z.array(z.string()).optional(),
+        user_interest_ids: z.array(z.string()).optional(),
+        fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_conversion_value_rule";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resource = buildConversionValueRuleResource(params);
+        const result = await customer.conversionValueRules.create(
+          [resource] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: {
+            conversion_value_rule: resource,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildConversionValueRuleResource(
+  params: ConversionValueRuleInput
+) {
+  const resource = {
+    action: {
+      operation: enumValue(enums.ValueRuleOperation, params.operation),
+      value: params.value,
+    },
+    status: enumValue(
+      enums.ConversionValueRuleStatus,
+      params.status ?? "ENABLED"
+    ),
+    ...buildConversionValueRuleConditions(params),
+    ...(params.fields ?? {}),
+  };
+  const hasCondition =
+    "geo_location_condition" in resource ||
+    "device_condition" in resource ||
+    "audience_condition" in resource ||
+    params.fields != null;
+  if (!hasCondition) {
+    throw new Error(
+      "Provide at least one geo/device/audience condition or raw fields for the value rule."
+    );
+  }
+  return resource;
+}
+
+function buildConversionValueRuleConditions(params: ConversionValueRuleInput) {
+  const conditions: Record<string, unknown> = {};
+  if (
+    params.geo_target_constant_ids?.length ||
+    params.excluded_geo_target_constant_ids?.length ||
+    params.geo_match_type ||
+    params.excluded_geo_match_type
+  ) {
+    conditions.geo_location_condition = {
+      ...(params.geo_target_constant_ids?.length
+        ? {
+            geo_target_constants: params.geo_target_constant_ids.map((id) =>
+              customerScopedConstant("geoTargetConstants", id)
+            ),
+          }
+        : {}),
+      ...(params.excluded_geo_target_constant_ids?.length
+        ? {
+            excluded_geo_target_constants:
+              params.excluded_geo_target_constant_ids.map((id) =>
+                customerScopedConstant("geoTargetConstants", id)
+              ),
+          }
+        : {}),
+      ...(params.geo_match_type
+        ? {
+            geo_match_type: enumValue(
+              enums.ValueRuleGeoLocationMatchType,
+              params.geo_match_type
+            ),
+          }
+        : {}),
+      ...(params.excluded_geo_match_type
+        ? {
+            excluded_geo_match_type: enumValue(
+              enums.ValueRuleGeoLocationMatchType,
+              params.excluded_geo_match_type
+            ),
+          }
+        : {}),
+    };
+  }
+  if (params.device_types?.length) {
+    conditions.device_condition = {
+      device_types: params.device_types.map((deviceType) =>
+        enumValue(enums.ValueRuleDeviceType, deviceType)
+      ),
+    };
+  }
+  if (params.user_list_ids?.length || params.user_interest_ids?.length) {
+    conditions.audience_condition = {
+      ...(params.user_list_ids?.length
+        ? {
+            user_lists: params.user_list_ids.map((id) =>
+              toResourceName(params.customer_id, "userLists", id)
+            ),
+          }
+        : {}),
+      ...(params.user_interest_ids?.length
+        ? {
+            user_interests: params.user_interest_ids.map((id) =>
+              customerScopedConstant("userInterests", id)
+            ),
+          }
+        : {}),
+    };
+  }
+  return conditions;
 }
 
 function registerValidateOfflineConversionPayload(server: McpServer) {

@@ -3,6 +3,7 @@ import { enums } from "google-ads-api";
 import {
   buildPerformanceMaxCampaignBundleOperations,
   buildSearchCampaignBundleOperations,
+  buildShoppingCampaignBundleOperations,
 } from "./campaign-admin";
 
 describe("buildSearchCampaignBundleOperations", () => {
@@ -112,6 +113,55 @@ describe("buildSearchCampaignBundleOperations", () => {
       asset_group: "customers/123/assetGroups/-3",
       asset: "customers/123/assets/111",
       field_type: enums.AssetFieldType.MARKETING_IMAGE,
+    });
+  });
+
+  it("builds one atomic Shopping campaign bundle with a product ad", () => {
+    const operations = buildShoppingCampaignBundleOperations({
+      customer_id: "123",
+      name: "Shopping Test",
+      daily_budget: 80,
+      merchant_id: 999,
+      feed_label: "US",
+      campaign_priority: 1,
+      initial_status: "ENABLED",
+      bidding_strategy: "MAXIMIZE_CLICKS",
+      cpc_bid_ceiling: 2,
+      ad_group: {
+        name: "Products",
+        cpc_bid: 1.5,
+      },
+      geo_target_constant_ids: ["2840"],
+    });
+
+    expect(operations.map((operation) => operation.entity)).toEqual([
+      "campaign_budget",
+      "campaign",
+      "ad_group",
+      "ad_group_ad",
+      "campaign_criterion",
+    ]);
+    expect(operations[1].resource).toMatchObject({
+      resource_name: "customers/123/campaigns/-2",
+      advertising_channel_type: enums.AdvertisingChannelType.SHOPPING,
+      campaign_budget: "customers/123/campaignBudgets/-1",
+      shopping_setting: {
+        merchant_id: 999,
+        feed_label: "US",
+        campaign_priority: 1,
+      },
+      target_spend: { cpc_bid_ceiling_micros: 2_000_000 },
+    });
+    expect(operations[2].resource).toMatchObject({
+      resource_name: "customers/123/adGroups/-3",
+      campaign: "customers/123/campaigns/-2",
+      type: enums.AdGroupType.SHOPPING_PRODUCT_ADS,
+      cpc_bid_micros: 1_500_000,
+    });
+    expect(operations[3].resource).toMatchObject({
+      ad_group: "customers/123/adGroups/-3",
+      status: enums.AdGroupAdStatus.ENABLED,
+      ad: { shopping_product_ad: {} },
     });
   });
 });

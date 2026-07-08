@@ -21,10 +21,10 @@ The MCP endpoint is served at `/api/[transport]` and protected by `withMcpAuth`.
 | Category | Tools |
 |------|-------------|
 | Access/search | `list_accessible_customers`, `search`, `search_stream`, `validate_gaql`, `discover_google_ads_fields`, `list_report_templates` |
-| Campaigns | `create_campaign`, `create_search_campaign_bundle`, typed `create_performance_max_campaign_bundle`, channel campaign shell tools, campaign list/get/update/status/remove, budget, bidding, date, network, URL, targeting tools |
+| Campaigns | `create_campaign`, typed Search/PMax/Shopping campaign bundles, channel campaign shell tools, campaign list/get/update/status/remove, budget, bidding, date, network, URL, targeting tools |
 | Ad groups/keywords | `create_ad_group`, ad group list/get/update/status/remove, positive keywords, campaign/ad group negatives, shared negative keyword sets |
-| Ads/assets/policy | `get_ad`, `create_responsive_search_ad`, `replace_responsive_search_ad`, typed `create_responsive_display_ad`, raw ad-format wrappers, asset create/list/get/remove/attach/detach, policy summary and ad-copy validation |
-| Conversions | conversion action CRUD, typed offline/website conversion action creators, customer/campaign/custom goals, biddable goal helpers, value rules, custom variables, upload tools, upload capability check, diagnostics |
+| Ads/assets/policy | `get_ad`, `create_responsive_search_ad`, `replace_responsive_search_ad`, typed `create_responsive_display_ad` and `create_dynamic_search_ad`, raw ad-format wrappers, asset create/list/get/remove/attach/detach, policy summary and ad-copy validation |
+| Conversions | conversion action CRUD, typed offline/website conversion action creators, customer/campaign/custom goals, biddable goal helpers, typed custom variables/value rules, upload tools, upload capability check, diagnostics |
 | Reporting/research | account/campaign/ad group/keyword/search term/ad/asset/landing page/geo/device/hour/conversion/change reports, keyword planning, recommendations, allowlist-aware insights |
 | Experiments | ad-variation flow plus list/schedule/end/promote/remove/async-error tools |
 | Account/admin | customer metadata, hierarchy, user access, manager/product links, billing/account-budget reads, change status, permission diagnostics |

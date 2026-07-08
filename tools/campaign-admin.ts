@@ -86,6 +86,38 @@ export type PerformanceMaxCampaignBundleInput = {
   language_constant_ids?: string[];
 };
 
+export type ShoppingCampaignBundleInput = {
+  customer_id: string;
+  name: string;
+  daily_budget: number;
+  merchant_id: number;
+  feed_label?: string;
+  campaign_priority?: number;
+  enable_local?: boolean;
+  use_vehicle_inventory?: boolean;
+  disable_product_feed?: boolean;
+  initial_status?: "PAUSED" | "ENABLED";
+  bidding_strategy?: "MANUAL_CPC" | "MAXIMIZE_CLICKS";
+  cpc_bid?: number;
+  cpc_bid_ceiling?: number;
+  start_date?: string;
+  end_date?: string;
+  campaign_fields?: JsonRecord;
+  ad_group?: {
+    name?: string;
+    status?: "PAUSED" | "ENABLED";
+    cpc_bid?: number;
+    final_url_suffix?: string;
+    tracking_url_template?: string;
+    url_custom_parameters?: Array<{ key: string; value: string }>;
+    fields?: JsonRecord;
+  };
+  create_product_ad?: boolean;
+  product_ad_status?: "PAUSED" | "ENABLED";
+  geo_target_constant_ids?: string[];
+  language_constant_ids?: string[];
+};
+
 export function registerCampaignAdminTools(server: McpServer) {
   registerCampaignReadTools(server);
   registerCampaignMutateTools(server);
@@ -1110,17 +1142,13 @@ export function buildSearchCampaignBundleOperations(
 
 function registerChannelCampaignBundleTools(server: McpServer) {
   registerPerformanceMaxCampaignBundle(server);
+  registerShoppingCampaignBundle(server);
 
   const tools = [
     {
       name: "create_demand_gen_campaign_bundle",
       title: "Create Demand Gen Campaign Bundle",
       channel: "DEMAND_GEN",
-    },
-    {
-      name: "create_shopping_campaign_bundle",
-      title: "Create Shopping Campaign Bundle",
-      channel: "SHOPPING",
     },
     {
       name: "create_app_campaign_bundle",
@@ -1209,6 +1237,225 @@ function registerChannelCampaignBundleTools(server: McpServer) {
       }
     );
   }
+}
+
+function registerShoppingCampaignBundle(server: McpServer) {
+  server.registerTool(
+    "create_shopping_campaign_bundle",
+    {
+      title: "Create Shopping Campaign Bundle",
+      description:
+        "Atomically create a Shopping campaign with budget, shopping setting, ad group, optional product ad, and basic geo/language criteria.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        daily_budget: z.number().positive(),
+        merchant_id: z.number().int().positive(),
+        feed_label: z.string().optional(),
+        campaign_priority: z.number().int().min(0).max(2).optional(),
+        enable_local: z.boolean().optional(),
+        use_vehicle_inventory: z.boolean().optional(),
+        disable_product_feed: z.boolean().optional(),
+        initial_status: CAMPAIGN_STATUS.optional(),
+        bidding_strategy: z.enum(["MANUAL_CPC", "MAXIMIZE_CLICKS"]).optional(),
+        cpc_bid: z.number().positive().optional(),
+        cpc_bid_ceiling: z.number().positive().optional(),
+        start_date: z.string().regex(DATE_RE).optional(),
+        end_date: z.string().regex(DATE_RE).optional(),
+        campaign_fields: jsonRecordSchema.optional(),
+        ad_group: z
+          .object({
+            name: z.string().min(1).optional(),
+            status: CAMPAIGN_STATUS.optional(),
+            cpc_bid: z.number().positive().optional(),
+            final_url_suffix: z.string().optional(),
+            tracking_url_template: z.string().optional(),
+            url_custom_parameters: z
+              .array(z.object({ key: z.string(), value: z.string() }))
+              .optional(),
+            fields: jsonRecordSchema.optional(),
+          })
+          .optional(),
+        create_product_ad: z.boolean().optional(),
+        product_ad_status: CAMPAIGN_STATUS.optional(),
+        geo_target_constant_ids: z.array(z.string()).optional(),
+        language_constant_ids: z.array(z.string()).optional(),
+        validate_only: z.boolean().optional(),
+      },
+    },
+    async (params) => {
+      const tool = "create_shopping_campaign_bundle";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const operations = buildShoppingCampaignBundleOperations(params);
+        const result = await customer.mutateResources(operations, {
+          validate_only: params.validate_only ?? false,
+        });
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: {
+            operation_count: operations.length,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildShoppingCampaignBundleOperations(
+  params: ShoppingCampaignBundleInput
+): MutateOperation<unknown>[] {
+  const cid = params.customer_id;
+  const budgetTmp = ResourceNames.campaignBudget(cid, "-1");
+  const campaignTmp = ResourceNames.campaign(cid, "-2");
+  const adGroupTmp = ResourceNames.adGroup(cid, "-3");
+  const adGroup = params.ad_group ?? {};
+  const operations: MutateOperation<unknown>[] = [
+    {
+      entity: "campaign_budget",
+      operation: "create",
+      resource: {
+        resource_name: budgetTmp,
+        name: `${params.name} budget`,
+        amount_micros: toMicros(params.daily_budget),
+        delivery_method: enums.BudgetDeliveryMethod.STANDARD,
+        explicitly_shared: false,
+      },
+    },
+    {
+      entity: "campaign",
+      operation: "create",
+      resource: {
+        resource_name: campaignTmp,
+        name: params.name,
+        status: enumValue(enums.CampaignStatus, params.initial_status ?? "PAUSED"),
+        advertising_channel_type: enums.AdvertisingChannelType.SHOPPING,
+        campaign_budget: budgetTmp,
+        contains_eu_political_advertising:
+          enums.EuPoliticalAdvertisingStatus
+            .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
+        shopping_setting: {
+          merchant_id: params.merchant_id,
+          ...(params.feed_label ? { feed_label: params.feed_label } : {}),
+          ...(params.campaign_priority != null
+            ? { campaign_priority: params.campaign_priority }
+            : {}),
+          ...(params.enable_local != null
+            ? { enable_local: params.enable_local }
+            : {}),
+          ...(params.use_vehicle_inventory != null
+            ? { use_vehicle_inventory: params.use_vehicle_inventory }
+            : {}),
+          ...(params.disable_product_feed != null
+            ? { disable_product_feed: params.disable_product_feed }
+            : {}),
+        },
+        ...buildShoppingBiddingStrategy(params),
+        ...(params.start_date ? { start_date: params.start_date } : {}),
+        ...(params.end_date ? { end_date: params.end_date } : {}),
+        ...(params.campaign_fields ?? {}),
+      },
+    },
+    {
+      entity: "ad_group",
+      operation: "create",
+      resource: {
+        resource_name: adGroupTmp,
+        name: adGroup.name ?? `${params.name} products`,
+        campaign: campaignTmp,
+        status: enumValue(
+          enums.AdGroupStatus,
+          adGroup.status ?? params.initial_status ?? "PAUSED"
+        ),
+        type: enums.AdGroupType.SHOPPING_PRODUCT_ADS,
+        ...(adGroup.cpc_bid ?? params.cpc_bid
+          ? { cpc_bid_micros: toMicros(adGroup.cpc_bid ?? params.cpc_bid ?? 0) }
+          : {}),
+        ...(adGroup.final_url_suffix
+          ? { final_url_suffix: adGroup.final_url_suffix }
+          : {}),
+        ...(adGroup.tracking_url_template
+          ? { tracking_url_template: adGroup.tracking_url_template }
+          : {}),
+        ...(adGroup.url_custom_parameters
+          ? { url_custom_parameters: adGroup.url_custom_parameters }
+          : {}),
+        ...(adGroup.fields ?? {}),
+      },
+    },
+  ];
+
+  if (params.create_product_ad ?? true) {
+    operations.push({
+      entity: "ad_group_ad",
+      operation: "create",
+      resource: {
+        ad_group: adGroupTmp,
+        status: enumValue(
+          enums.AdGroupAdStatus,
+          params.product_ad_status ?? adGroup.status ?? params.initial_status ?? "PAUSED"
+        ),
+        ad: {
+          shopping_product_ad: {},
+        },
+      },
+    });
+  }
+  for (const id of params.geo_target_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign: campaignTmp,
+        location: {
+          geo_target_constant: customerScopedConstant("geoTargetConstants", id),
+        },
+      },
+    });
+  }
+  for (const id of params.language_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign: campaignTmp,
+        language: {
+          language_constant: customerScopedConstant("languageConstants", id),
+        },
+      },
+    });
+  }
+
+  return operations;
+}
+
+function buildShoppingBiddingStrategy(
+  params: Pick<
+    ShoppingCampaignBundleInput,
+    "bidding_strategy" | "cpc_bid_ceiling"
+  >
+) {
+  if (params.bidding_strategy === "MAXIMIZE_CLICKS") {
+    return {
+      target_spend:
+        params.cpc_bid_ceiling != null
+          ? { cpc_bid_ceiling_micros: toMicros(params.cpc_bid_ceiling) }
+          : {},
+    };
+  }
+  return {
+    manual_cpc: {},
+  };
 }
 
 function registerPerformanceMaxCampaignBundle(server: McpServer) {

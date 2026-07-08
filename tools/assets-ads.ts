@@ -55,6 +55,19 @@ export type ResponsiveDisplayAdInput = {
   status?: "ENABLED" | "PAUSED";
 };
 
+export type DynamicSearchAdInput = {
+  customer_id: string;
+  ad_group_id: string;
+  description: string;
+  description2?: string;
+  status?: "ENABLED" | "PAUSED";
+  tracking_url_template?: string;
+  final_url_suffix?: string;
+  url_custom_parameters?: Array<{ key: string; value: string }>;
+  ad_fields?: JsonRecord;
+  expanded_dynamic_search_ad_fields?: JsonRecord;
+};
+
 function registerAssetTools(server: McpServer) {
   server.registerTool(
     "list_assets",
@@ -204,12 +217,7 @@ function registerAdFormatTools(server: McpServer) {
     description:
       "Create a Shopping/Product ad. Pass the shopping ad payload under ad.",
   });
-  registerRawAdTool(server, {
-    name: "create_dynamic_search_ad",
-    title: "Create Dynamic Search Ad",
-    description:
-      "Create a Dynamic Search Ad. Pass expanded_dynamic_search_ad under ad.",
-  });
+  registerCreateDynamicSearchAd(server);
   registerRawAdTool(server, {
     name: "create_app_ad",
     title: "Create App Ad",
@@ -504,6 +512,81 @@ function toAssetRefs(customerId: string, assetIds: string[]) {
   return assetIds.map((assetId) => ({
     asset: toResourceName(customerId, "assets", assetId),
   }));
+}
+
+function registerCreateDynamicSearchAd(server: McpServer) {
+  server.registerTool(
+    "create_dynamic_search_ad",
+    {
+      title: "Create Dynamic Search Ad",
+      description:
+        "Create an Expanded Dynamic Search Ad in a DSA ad group. Configure domain/page targets separately.",
+      inputSchema: {
+        customer_id: z.string(),
+        ad_group_id: z.string().describe("Ad group resource name or numeric ID."),
+        description: z.string().max(90),
+        description2: z.string().max(90).optional(),
+        status: z.enum(["ENABLED", "PAUSED"]).optional(),
+        tracking_url_template: z.string().optional(),
+        final_url_suffix: z.string().optional(),
+        url_custom_parameters: z
+          .array(z.object({ key: z.string(), value: z.string() }))
+          .optional(),
+        ad_fields: jsonRecordSchema.optional(),
+        expanded_dynamic_search_ad_fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_dynamic_search_ad";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.adGroupAds.create(
+          [buildDynamicSearchAdResource(params)],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildDynamicSearchAdResource(
+  params: DynamicSearchAdInput
+): JsonRecord {
+  return {
+    ad_group: toResourceName(params.customer_id, "adGroups", params.ad_group_id),
+    status: enumValue(enums.AdGroupAdStatus, params.status ?? "ENABLED"),
+    ad: {
+      ...(params.tracking_url_template
+        ? { tracking_url_template: params.tracking_url_template }
+        : {}),
+      ...(params.final_url_suffix
+        ? { final_url_suffix: params.final_url_suffix }
+        : {}),
+      ...(params.url_custom_parameters
+        ? { url_custom_parameters: params.url_custom_parameters }
+        : {}),
+      expanded_dynamic_search_ad: {
+        description: params.description,
+        ...(params.description2 ? { description2: params.description2 } : {}),
+        ...(params.expanded_dynamic_search_ad_fields ?? {}),
+      },
+      ...(params.ad_fields ?? {}),
+    },
+  };
 }
 
 function registerRawAdTool(

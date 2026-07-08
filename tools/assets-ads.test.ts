@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { enums } from "google-ads-api";
-import { buildResponsiveDisplayAdResource } from "./assets-ads";
+import {
+  buildDynamicSearchAdResource,
+  buildResponsiveDisplayAdResource,
+} from "./assets-ads";
 
 describe("buildResponsiveDisplayAdResource", () => {
   it("builds a typed responsive display ad payload from assets and copy", () => {
@@ -43,6 +46,29 @@ describe("buildResponsiveDisplayAdResource", () => {
             enable_asset_enhancements: true,
             enable_autogen_video: false,
           },
+        },
+      },
+    });
+  });
+
+  it("builds a typed dynamic search ad payload", () => {
+    expect(
+      buildDynamicSearchAdResource({
+        customer_id: "123",
+        ad_group_id: "456",
+        description: "Find the right plan for your team.",
+        description2: "Compare options and get started today.",
+        final_url_suffix: "src=dsa",
+        status: "ENABLED",
+      })
+    ).toMatchObject({
+      ad_group: "customers/123/adGroups/456",
+      status: enums.AdGroupAdStatus.ENABLED,
+      ad: {
+        final_url_suffix: "src=dsa",
+        expanded_dynamic_search_ad: {
+          description: "Find the right plan for your team.",
+          description2: "Compare options and get started today.",
         },
       },
     });
