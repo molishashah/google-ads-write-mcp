@@ -7,7 +7,12 @@ import {
 } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
-import { mcpText, mcpError } from "@/lib/mcp-helpers";
+import {
+  enumValue,
+  extractRequestId,
+  extractResourceNames,
+} from "@/lib/google-ads-utils";
+import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
 
 // ──────────────────────────────────────────────────────────────────────
 // Campaign structure tools (create campaign + ad group)
@@ -17,9 +22,8 @@ import { mcpText, mcpError } from "@/lib/mcp-helpers";
 //   add_keywords.
 //
 // Safety choices (matching the rest of this server):
-//   - New campaigns are created PAUSED. They never auto-spend; review the
-//     budget/targeting, add ad groups + ads, then flip to ENABLED in the
-//     Google Ads UI. There is no un-pause tool here on purpose.
+//   - New campaigns default to PAUSED. Callers can explicitly set ENABLED
+//     when they want a complete UI-free launch.
 //   - Bidding is Maximize Clicks (the `target_spend` strategy). It needs
 //     no conversion history, so it is the safe default for a brand-new
 //     campaign. Switch strategies in the UI later if you want.
@@ -55,10 +59,9 @@ function registerCreateCampaign(server: McpServer) {
       title: "Create Search Campaign",
       description:
         "Create a new Search campaign with its own daily budget, in a " +
-        "single atomic operation. The campaign is created PAUSED so it " +
-        "never starts spending on its own — add ad groups (create_ad_group) " +
-        "and ads (create_responsive_search_ad), then enable it in the " +
-        "Google Ads UI when you're ready. Bidding is set to Maximize Clicks " +
+        "single atomic operation. The campaign defaults to PAUSED so it " +
+        "never starts spending on its own, but you can pass " +
+        "initial_status=ENABLED for UI-free launch after setup. Bidding is set to Maximize Clicks " +
         "(target_spend), which needs no conversion history and is the safe " +
         "default for a new campaign. To retire a campaign later use " +
         "pause_campaign — there is no delete (a removed campaign is " +
@@ -119,6 +122,10 @@ function registerCreateCampaign(server: McpServer) {
             "Optional campaign end date, format YYYY-MM-DD. Omit to run with " +
               "no end date."
           ),
+        initial_status: z
+          .enum(["PAUSED", "ENABLED"])
+          .optional()
+          .describe("Initial campaign status. Default: PAUSED."),
         validate_only: z
           .boolean()
           .optional()
@@ -129,6 +136,7 @@ function registerCreateCampaign(server: McpServer) {
       },
     },
     async (params) => {
+      const tool = "create_campaign";
       try {
         const customer = getAdsClient(params.customer_id);
         const cid = params.customer_id;
@@ -158,7 +166,10 @@ function registerCreateCampaign(server: McpServer) {
             operation: "create",
             resource: {
               name: params.name,
-              status: enums.CampaignStatus.PAUSED,
+              status: enumValue(
+                enums.CampaignStatus,
+                params.initial_status ?? "PAUSED"
+              ),
               advertising_channel_type: enums.AdvertisingChannelType.SEARCH,
               campaign_budget: budgetTmp,
               // Required by the Google Ads API on campaign create. Augment
@@ -191,16 +202,18 @@ function registerCreateCampaign(server: McpServer) {
         })) as unknown as MutateResponse;
 
         if (params.validate_only) {
-          return mcpText(
-            [
-              "✅ validate_only: budget + campaign passed Google Ads validation.",
-              "",
-              `  Campaign: ${params.name} (Search, PAUSED)`,
-              `  Budget:   ${params.daily_budget}/day, Maximize Clicks bidding`,
-              "",
-              "Nothing was created. Re-run with validate_only=false to create it.",
-            ].join("\n")
-          );
+          return mcpSuccess({
+            tool,
+            customer_id: params.customer_id,
+            validate_only: true,
+            resource_names: [],
+            results: {
+              message: "Budget + campaign passed Google Ads validation.",
+              campaign: params.name,
+              status: params.initial_status ?? "PAUSED",
+              daily_budget: params.daily_budget,
+            },
+          });
         }
 
         const responses = result.mutate_operation_responses ?? [];
@@ -212,25 +225,34 @@ function registerCreateCampaign(server: McpServer) {
           .find(Boolean);
 
         if (!campaignRn) {
-          return mcpError(
-            "creating campaign",
-            new Error("mutate succeeded but no campaign resource_name returned")
+          return mcpJsonError(
+            tool,
+            new Error("mutate succeeded but no campaign resource_name returned"),
+            { customer_id: params.customer_id }
           );
         }
 
-        return mcpText(
-          `Created campaign: ${campaignRn}\n` +
-            (budgetRn ? `Budget:           ${budgetRn}\n` : "") +
-            `Status: PAUSED · Channel: SEARCH · Bidding: Maximize Clicks · ` +
-            `Daily budget: ${params.daily_budget}\n\n` +
-            `Next steps:\n` +
-            `  1. create_ad_group with this campaign's resource name\n` +
-            `  2. create_responsive_search_ad + add_keywords in that ad group\n` +
-            `  3. Enable the campaign in the Google Ads UI when ready ` +
-            `(it's paused so it won't spend until you do).`
-        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: false,
+          resource_names: extractResourceNames(result),
+          results: {
+            campaign: campaignRn,
+            budget: budgetRn,
+            status: params.initial_status ?? "PAUSED",
+            channel: "SEARCH",
+            bidding: "MAXIMIZE_CLICKS",
+            daily_budget: params.daily_budget,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
       } catch (err) {
-        return mcpError("creating campaign", err);
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
       }
     }
   );
@@ -286,6 +308,7 @@ function registerCreateAdGroup(server: McpServer) {
       },
     },
     async (params) => {
+      const tool = "create_ad_group";
       try {
         const customer = getAdsClient(params.customer_id);
 
@@ -305,34 +328,41 @@ function registerCreateAdGroup(server: McpServer) {
         );
 
         if (params.validate_only) {
-          return mcpText(
-            [
-              "✅ validate_only: ad group passed Google Ads validation.",
-              "",
-              `  Ad group: ${params.name}`,
-              `  Campaign: ${params.campaign_id}`,
-              "",
-              "Nothing was created. Re-run with validate_only=false to create it.",
-            ].join("\n")
-          );
+          return mcpSuccess({
+            tool,
+            customer_id: params.customer_id,
+            validate_only: true,
+            resource_names: [],
+            results: {
+              message: "Ad group passed Google Ads validation.",
+              ad_group: params.name,
+              campaign: params.campaign_id,
+            },
+          });
         }
 
         const resourceName = result.results?.[0]?.resource_name;
         if (!resourceName) {
-          return mcpError(
-            "creating ad group",
-            new Error("mutate succeeded but no resource_name was returned")
+          return mcpJsonError(
+            tool,
+            new Error("mutate succeeded but no resource_name was returned"),
+            { customer_id: params.customer_id }
           );
         }
 
-        return mcpText(
-          `Created ad group: ${resourceName}\n\n` +
-            `Next step: create_responsive_search_ad and add_keywords with ` +
-            `this ad group resource name. It will start serving once the ` +
-            `parent campaign is enabled.`
-        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: false,
+          resource_names: [resourceName],
+          results: result,
+          request_id: extractRequestId(result),
+        });
       } catch (err) {
-        return mcpError("creating ad group", err);
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
       }
     }
   );

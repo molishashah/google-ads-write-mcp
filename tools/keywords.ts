@@ -2,11 +2,20 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { enums } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
-import { mcpText, mcpError } from "@/lib/mcp-helpers";
+import {
+  enumValue,
+  extractRequestId,
+  extractResourceNames,
+  toResourceName,
+} from "@/lib/google-ads-utils";
+import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
+import { mutateOptionSchema, mutateOptions } from "@/tools/tool-utils";
 
 export function registerKeywordTools(server: McpServer) {
   registerAddKeywords(server);
   registerAddNegativeKeywords(server);
+  registerAddAdGroupNegativeKeywords(server);
+  registerSharedNegativeKeywordTools(server);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -51,16 +60,11 @@ function registerAddKeywords(server: McpServer) {
           .min(1)
           .max(200)
           .describe("Keywords to add (1–200 per call)"),
-        validate_only: z
-          .boolean()
-          .optional()
-          .describe(
-            "If true, validate the request against Google Ads rules but " +
-              "do NOT actually add the keywords. Default: false."
-          ),
+        ...mutateOptionSchema,
       },
     },
     async (params) => {
+      const tool = "add_keywords";
       try {
         const customer = getAdsClient(params.customer_id);
 
@@ -75,27 +79,22 @@ function registerAddKeywords(server: McpServer) {
 
         const result = await customer.adGroupCriteria.create(operations, {
           validate_only: params.validate_only ?? false,
+          partial_failure: params.partial_failure ?? false,
         });
 
-        if (params.validate_only) {
-          return mcpText(
-            `✅ validate_only: ${params.keywords.length} keyword(s) passed ` +
-              "Google Ads validation. No keywords were added."
-          );
-        }
-
-        const resourceNames = (result.results ?? [])
-          .map((r) => r.resource_name)
-          .filter(Boolean);
-
-        return mcpText(
-          `Added ${resourceNames.length} keyword(s) to ${params.ad_group_id}:\n\n` +
-            params.keywords
-              .map((kw, i) => `  ${kw.match_type} "${kw.text}" → ${resourceNames[i] ?? "ok"}`)
-              .join("\n")
-        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
       } catch (err) {
-        return mcpError("adding keywords", err);
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
       }
     }
   );
@@ -139,16 +138,11 @@ function registerAddNegativeKeywords(server: McpServer) {
           .min(1)
           .max(200)
           .describe("Negative keywords to add (1–200 per call)"),
-        validate_only: z
-          .boolean()
-          .optional()
-          .describe(
-            "If true, validate the request against Google Ads rules but " +
-              "do NOT actually add the negative keywords. Default: false."
-          ),
+        ...mutateOptionSchema,
       },
     },
     async (params) => {
+      const tool = "add_negative_keywords";
       try {
         const customer = getAdsClient(params.customer_id);
 
@@ -163,27 +157,275 @@ function registerAddNegativeKeywords(server: McpServer) {
 
         const result = await customer.campaignCriteria.create(operations, {
           validate_only: params.validate_only ?? false,
+          partial_failure: params.partial_failure ?? false,
         });
 
-        if (params.validate_only) {
-          return mcpText(
-            `✅ validate_only: ${params.keywords.length} negative keyword(s) ` +
-              "passed Google Ads validation. No keywords were added."
-          );
-        }
-
-        const resourceNames = (result.results ?? [])
-          .map((r) => r.resource_name)
-          .filter(Boolean);
-
-        return mcpText(
-          `Added ${resourceNames.length} negative keyword(s) to ${params.campaign_id}:\n\n` +
-            params.keywords
-              .map((kw, i) => `  ${kw.match_type} "${kw.text}" → ${resourceNames[i] ?? "ok"}`)
-              .join("\n")
-        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
       } catch (err) {
-        return mcpError("adding negative keywords", err);
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+function registerAddAdGroupNegativeKeywords(server: McpServer) {
+  server.registerTool(
+    "add_ad_group_negative_keywords",
+    {
+      title: "Add Negative Keywords to Ad Group",
+      description: "Add negative keywords at ad group level.",
+      inputSchema: {
+        customer_id: z.string(),
+        ad_group_id: z.string().describe("Ad group resource name or numeric ID."),
+        keywords: z
+          .array(
+            z.object({
+              text: z.string(),
+              match_type: z.enum(["BROAD", "PHRASE", "EXACT"]),
+            })
+          )
+          .min(1)
+          .max(200),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "add_ad_group_negative_keywords";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const adGroup = toResourceName(
+          params.customer_id,
+          "adGroups",
+          params.ad_group_id
+        );
+        const result = await customer.adGroupCriteria.create(
+          params.keywords.map((kw) => ({
+            ad_group: adGroup,
+            negative: true,
+            keyword: {
+              text: kw.text,
+              match_type: MATCH_TYPE_MAP[kw.match_type],
+            },
+          })),
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+function registerSharedNegativeKeywordTools(server: McpServer) {
+  server.registerTool(
+    "create_negative_keyword_shared_set",
+    {
+      title: "Create Negative Keyword Shared Set",
+      description: "Create a shared set for reusable negative keyword lists.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_negative_keyword_shared_set";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.sharedSets.create(
+          [
+            {
+              name: params.name,
+              type: enumValue(enums.SharedSetType, "NEGATIVE_KEYWORDS") as never,
+            },
+          ] as never[],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+
+  server.registerTool(
+    "add_shared_negative_keywords",
+    {
+      title: "Add Keywords to Negative Shared Set",
+      description: "Add negative keyword criteria to a shared negative keyword set.",
+      inputSchema: {
+        customer_id: z.string(),
+        shared_set_id: z.string().describe("Shared set resource name or numeric ID."),
+        keywords: z
+          .array(
+            z.object({
+              text: z.string(),
+              match_type: z.enum(["BROAD", "PHRASE", "EXACT"]),
+            })
+          )
+          .min(1)
+          .max(200),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "add_shared_negative_keywords";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const sharedSet = toResourceName(
+          params.customer_id,
+          "sharedSets",
+          params.shared_set_id
+        );
+        const result = await customer.sharedCriteria.create(
+          params.keywords.map((kw) => ({
+            shared_set: sharedSet,
+            negative: true,
+            keyword: {
+              text: kw.text,
+              match_type: MATCH_TYPE_MAP[kw.match_type],
+            },
+          })),
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+
+  server.registerTool(
+    "attach_negative_keyword_shared_set",
+    {
+      title: "Attach Negative Keyword Shared Set",
+      description: "Attach a shared negative keyword set to a campaign.",
+      inputSchema: {
+        customer_id: z.string(),
+        campaign_id: z.string().describe("Campaign resource name or numeric ID."),
+        shared_set_id: z.string().describe("Shared set resource name or numeric ID."),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "attach_negative_keyword_shared_set";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.campaignSharedSets.create(
+          [
+            {
+              campaign: toResourceName(
+                params.customer_id,
+                "campaigns",
+                params.campaign_id
+              ),
+              shared_set: toResourceName(
+                params.customer_id,
+                "sharedSets",
+                params.shared_set_id
+              ),
+            },
+          ],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+
+  server.registerTool(
+    "remove_shared_negative_keyword_entities",
+    {
+      title: "Remove Shared Negative Keyword Entities",
+      description:
+        "Remove shared criteria, campaign shared-set links, or shared sets by resource name.",
+      inputSchema: {
+        customer_id: z.string(),
+        entity: z.enum(["sharedCriteria", "campaignSharedSets", "sharedSets"]),
+        resource_names: z.array(z.string()).min(1),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "remove_shared_negative_keyword_entities";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const collection = (
+          customer as unknown as Record<
+            string,
+            { remove: (resourceNames: string[], options?: unknown) => Promise<unknown> }
+          >
+        )[params.entity];
+        const result = await collection.remove(
+          params.resource_names,
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
       }
     }
   );

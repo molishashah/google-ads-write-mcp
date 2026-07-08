@@ -5,11 +5,13 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.26.0",
-    "google-ads-api": "^23.0.0",
+    "google-ads-api": "^24.1.0",
     "google-auth-library": "^10.6.2",
     "jose": "^6.2.2",
     "mcp-handler": "^1.1.0",
@@ -22,6 +24,7 @@
     "@types/node": "^20.19.39",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }

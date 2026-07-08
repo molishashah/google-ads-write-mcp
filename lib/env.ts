@@ -47,9 +47,8 @@ export const env = {
 
   // ───────────────────────────────────────────────────────
   // Layer 2: Team member identity via Google OAuth
-  // (mints the bearer JWT used by MCP clients; same OAuth
-  //  client used to mint the Layer 1 refresh token, but
-  //  the per-user OAuth here only verifies email + domain)
+  // (mints the bearer JWT used by MCP clients; Ads API calls use
+  //  the service-account identity configured above)
   // ───────────────────────────────────────────────────────
   get GOOGLE_CLIENT_ID() {
     return required("GOOGLE_CLIENT_ID");

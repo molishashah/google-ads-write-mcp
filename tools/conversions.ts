@@ -1,8 +1,27 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { enums, services } from "google-ads-api";
+import { enums, ResourceNames, services } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
-import { formatError, mcpError, mcpText } from "@/lib/mcp-helpers";
+import {
+  customerScopedConstant,
+  escapeGaql,
+  extractRequestId,
+  extractResourceNames,
+  toResourceName,
+} from "@/lib/google-ads-utils";
+import {
+  formatError,
+  mcpError,
+  mcpJsonError,
+  mcpSuccess,
+  mcpText,
+} from "@/lib/mcp-helpers";
+import {
+  jsonRecordSchema,
+  mutateOptions,
+  mutateOptionSchema,
+  registerCollectionMutateTool,
+} from "@/tools/tool-utils";
 
 const CUSTOMER_ID_RE = /^\d+$/;
 const CONVERSION_ACTION_RE = /^customers\/(\d+)\/conversionActions\/(\d+)$/;
@@ -12,6 +31,59 @@ const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
 const SHA256_HEX_ANY_CASE_RE = /^[a-fA-F0-9]{64}$/;
 const ENUM_RE = /^[A-Z][A-Z0-9_]*$/;
 const DEFAULT_CONVERSION_WINDOW_DAYS = 90;
+const CONVERSION_ACTION_CATEGORIES = [
+  "DEFAULT",
+  "PAGE_VIEW",
+  "PURCHASE",
+  "SIGNUP",
+  "DOWNLOAD",
+  "ADD_TO_CART",
+  "BEGIN_CHECKOUT",
+  "SUBSCRIBE_PAID",
+  "PHONE_CALL_LEAD",
+  "IMPORTED_LEAD",
+  "SUBMIT_LEAD_FORM",
+  "BOOK_APPOINTMENT",
+  "REQUEST_QUOTE",
+  "GET_DIRECTIONS",
+  "OUTBOUND_CLICK",
+  "CONTACT",
+  "ENGAGEMENT",
+  "STORE_VISIT",
+  "STORE_SALE",
+  "QUALIFIED_LEAD",
+  "CONVERTED_LEAD",
+  "YOUTUBE_FOLLOW_ON_VIEWS",
+] as const;
+const CONVERSION_GOAL_ORIGINS = [
+  "WEBSITE",
+  "GOOGLE_HOSTED",
+  "APP",
+  "CALL_FROM_ADS",
+  "STORE",
+  "YOUTUBE_HOSTED",
+] as const;
+const CONVERSION_ACTION_TYPES = [
+  "WEBPAGE",
+  "UPLOAD_CLICKS",
+  "UPLOAD_CALLS",
+  "AD_CALL",
+  "CLICK_TO_CALL",
+  "WEBSITE_CALL",
+  "STORE_SALES",
+  "STORE_SALES_DIRECT_UPLOAD",
+  "GOOGLE_HOSTED",
+  "LEAD_FORM_SUBMIT",
+] as const;
+const CONVERSION_CUSTOM_VARIABLE_STATUSES = [
+  "ACTIVATION_NEEDED",
+  "ENABLED",
+  "PAUSED",
+] as const;
+const CONVERSION_VALUE_RULE_STATUSES = ["ENABLED", "PAUSED", "REMOVED"] as const;
+const VALUE_RULE_OPERATIONS = ["ADD", "MULTIPLY", "SET"] as const;
+const VALUE_RULE_DEVICE_TYPES = ["MOBILE", "DESKTOP", "TABLET"] as const;
+const VALUE_RULE_GEO_MATCH_TYPES = ["ANY", "LOCATION_OF_PRESENCE"] as const;
 
 type ErrorClass =
   | "config"
@@ -70,6 +142,44 @@ type RawClickConversion = {
   conversion_environment?: NormalizedClickConversion["conversionEnvironment"];
   customerType?: NormalizedClickConversion["customerType"];
   customer_type?: NormalizedClickConversion["customerType"];
+};
+
+export type ConversionActionSetupInput = {
+  name: string;
+  type: (typeof CONVERSION_ACTION_TYPES)[number];
+  category?: (typeof CONVERSION_ACTION_CATEGORIES)[number];
+  status?: "ENABLED" | "REMOVED" | "HIDDEN";
+  include_in_conversions_metric?: boolean;
+  counting_type?: "ONE_PER_CLICK" | "MANY_PER_CLICK";
+  primary_for_goal?: boolean;
+  default_value?: number;
+  currency_code?: string;
+  always_use_default_value?: boolean;
+  click_through_lookback_window_days?: number;
+  view_through_lookback_window_days?: number;
+  fields?: Record<string, unknown>;
+};
+
+export type ConversionCustomVariableInput = {
+  name: string;
+  tag?: string;
+  status?: (typeof CONVERSION_CUSTOM_VARIABLE_STATUSES)[number];
+  fields?: Record<string, unknown>;
+};
+
+export type ConversionValueRuleInput = {
+  customer_id: string;
+  operation: (typeof VALUE_RULE_OPERATIONS)[number];
+  value: number;
+  status?: (typeof CONVERSION_VALUE_RULE_STATUSES)[number];
+  geo_target_constant_ids?: string[];
+  excluded_geo_target_constant_ids?: string[];
+  geo_match_type?: (typeof VALUE_RULE_GEO_MATCH_TYPES)[number];
+  excluded_geo_match_type?: (typeof VALUE_RULE_GEO_MATCH_TYPES)[number];
+  device_types?: Array<(typeof VALUE_RULE_DEVICE_TYPES)[number]>;
+  user_list_ids?: string[];
+  user_interest_ids?: string[];
+  fields?: Record<string, unknown>;
 };
 
 type GoogleAdsFailureLike = {
@@ -143,10 +253,17 @@ const clickConversionSchema = z.object({
 export function registerConversionTools(server: McpServer) {
   registerGetConversionCustomer(server);
   registerListConversionActions(server);
+  registerGetConversionAction(server);
   registerCreateConversionAction(server);
+  registerTypedConversionSetupTools(server);
+  registerConversionActionAdminTools(server);
+  registerGoalTools(server);
+  registerConversionValueTools(server);
   registerValidateOfflineConversionPayload(server);
   registerUploadClickConversions(server);
+  registerAdditionalUploadTools(server);
   registerGetOfflineConversionDiagnostics(server);
+  registerConversionDiagnostics(server);
 }
 
 function registerGetConversionCustomer(server: McpServer) {
@@ -302,19 +419,77 @@ function registerListConversionActions(server: McpServer) {
   );
 }
 
+function registerGetConversionAction(server: McpServer) {
+  server.registerTool(
+    "get_conversion_action",
+    {
+      title: "Get Conversion Action",
+      description: "Fetch one conversion action by resource name or numeric ID.",
+      inputSchema: {
+        customer_id: z.string().describe("Google Ads customer ID, no hyphens."),
+        conversion_action_id: z
+          .string()
+          .describe("Conversion action resource name or numeric ID."),
+      },
+    },
+    async (params) => {
+      const tool = "get_conversion_action";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const resourceName = toResourceName(
+          params.customer_id,
+          "conversionActions",
+          params.conversion_action_id
+        );
+        const query = `
+          SELECT
+            conversion_action.resource_name,
+            conversion_action.id,
+            conversion_action.name,
+            conversion_action.status,
+            conversion_action.type,
+            conversion_action.category,
+            conversion_action.origin,
+            conversion_action.primary_for_goal,
+            conversion_action.include_in_conversions_metric,
+            conversion_action.counting_type,
+            conversion_action.value_settings.default_value,
+            conversion_action.value_settings.always_use_default_value,
+            conversion_action.attribution_model_settings.attribution_model,
+            conversion_action.tag_snippets
+          FROM conversion_action
+          WHERE conversion_action.resource_name = '${escapeGaql(resourceName)}'
+          LIMIT 1`;
+        const rows = await customer.query(query);
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          resource_names: [resourceName],
+          results: { query, rows },
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+}
+
 function registerCreateConversionAction(server: McpServer) {
   server.registerTool(
     "create_conversion_action",
     {
-      title: "Create Upload Clicks Conversion Action",
+      title: "Create Conversion Action",
       description:
-        "Create an UPLOAD_CLICKS conversion action for offline conversions " +
-        "and enhanced conversions for leads. The action is created ENABLED " +
-        "unless status is provided.",
+        "Create a conversion action. Defaults to UPLOAD_CLICKS for offline " +
+        "conversions / EC4L, but type and raw fields can be supplied for other actions.",
       inputSchema: {
         customerId: z.string().optional().describe("Google Ads customer ID."),
         customer_id: z.string().optional().describe("Alias for customerId."),
         name: z.string().min(1).describe("Conversion action name."),
+        type: z
+          .string()
+          .optional()
+          .describe("ConversionActionType enum. Default: UPLOAD_CLICKS."),
         category: z
           .string()
           .optional()
@@ -345,10 +520,15 @@ function registerCreateConversionAction(server: McpServer) {
           .boolean()
           .optional()
           .describe("Default: false."),
+        primary_for_goal: z.boolean().optional(),
+        fields: jsonRecordSchema
+          .optional()
+          .describe("Additional raw ConversionAction fields."),
         validateOnly: z
           .boolean()
           .optional()
           .describe("Validate against Google without creating. Default: false."),
+        validate_only: z.boolean().optional().describe("Alias for validateOnly."),
       },
     },
     async (params) => {
@@ -359,7 +539,10 @@ function registerCreateConversionAction(server: McpServer) {
         const customer = getAdsClient(customerId.value);
         const conversionAction = {
           name: params.name,
-          type: enums.ConversionActionType.UPLOAD_CLICKS,
+          type: enumValue(
+            enums.ConversionActionType,
+            params.type ?? "UPLOAD_CLICKS"
+          ),
           category: enumValue(
             enums.ConversionActionCategory,
             params.category ?? "IMPORTED_LEAD"
@@ -373,6 +556,9 @@ function registerCreateConversionAction(server: McpServer) {
             enums.ConversionActionCountingType,
             params.countingType ?? "ONE_PER_CLICK"
           ),
+          ...(params.primary_for_goal != null
+            ? { primary_for_goal: params.primary_for_goal }
+            : {}),
           ...(params.defaultValue != null || params.currencyCode
             ? {
                 value_settings: {
@@ -383,41 +569,626 @@ function registerCreateConversionAction(server: McpServer) {
                 },
               }
             : {}),
+          ...(params.fields ?? {}),
         };
 
         const result = await customer.conversionActions.create(
-          [conversionAction],
-          { validate_only: params.validateOnly ?? false }
+          [conversionAction] as never[],
+          { validate_only: params.validateOnly ?? params.validate_only ?? false }
         );
 
-        if (params.validateOnly) {
-          return mcpText(
-            JSON.stringify(
-              {
-                validated: true,
-                conversion_action: conversionAction,
-              },
-              null,
-              2
-            )
-          );
+        const validateOnly = params.validateOnly ?? params.validate_only ?? false;
+        if (validateOnly) {
+          return mcpSuccess({
+            tool: "create_conversion_action",
+            customer_id: customerId.value,
+            validate_only: true,
+            results: {
+              validated: true,
+              conversion_action: conversionAction,
+            },
+          });
         }
 
-        return mcpText(
-          JSON.stringify(
-            {
-              resource_name: result.results?.[0]?.resource_name ?? null,
-              raw_result: result,
-            },
-            null,
-            2
-          )
-        );
+        return mcpSuccess({
+          tool: "create_conversion_action",
+          customer_id: customerId.value,
+          validate_only: false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
       } catch (err) {
         return mcpError("creating conversion action", err);
       }
     }
   );
+}
+
+function registerTypedConversionSetupTools(server: McpServer) {
+  registerTypedConversionActionTool(server, {
+    name: "create_offline_conversion_action",
+    title: "Create Offline Conversion Action",
+    description:
+      "Create an offline click conversion action for UploadClickConversions / enhanced conversions for leads.",
+    type: "UPLOAD_CLICKS",
+    defaultCategory: "IMPORTED_LEAD",
+  });
+  registerTypedConversionActionTool(server, {
+    name: "create_website_conversion_action",
+    title: "Create Website Conversion Action",
+    description: "Create a website conversion action for Google tag / webpage tracking.",
+    type: "WEBPAGE",
+    defaultCategory: "PAGE_VIEW",
+  });
+}
+
+function registerTypedConversionActionTool(
+  server: McpServer,
+  config: {
+    name: string;
+    title: string;
+    description: string;
+    type: (typeof CONVERSION_ACTION_TYPES)[number];
+    defaultCategory: (typeof CONVERSION_ACTION_CATEGORIES)[number];
+  }
+) {
+  server.registerTool(
+    config.name,
+    {
+      title: config.title,
+      description: config.description,
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        category: z.enum(CONVERSION_ACTION_CATEGORIES).optional(),
+        status: z.enum(["ENABLED", "REMOVED", "HIDDEN"]).optional(),
+        include_in_conversions_metric: z.boolean().optional(),
+        counting_type: z.enum(["ONE_PER_CLICK", "MANY_PER_CLICK"]).optional(),
+        primary_for_goal: z.boolean().optional(),
+        default_value: z.number().finite().optional(),
+        currency_code: z.string().length(3).optional(),
+        always_use_default_value: z.boolean().optional(),
+        click_through_lookback_window_days: z.number().int().positive().optional(),
+        view_through_lookback_window_days: z.number().int().positive().optional(),
+        fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = config.name;
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const conversionAction = buildConversionActionResource({
+          ...params,
+          type: config.type,
+          category: params.category ?? config.defaultCategory,
+        });
+        const result = await customer.conversionActions.create(
+          [conversionAction] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: {
+            conversion_action: conversionAction,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildConversionActionResource(
+  params: ConversionActionSetupInput
+) {
+  return {
+    name: params.name,
+    type: enumValue(enums.ConversionActionType, params.type),
+    category: enumValue(
+      enums.ConversionActionCategory,
+      params.category ?? "DEFAULT"
+    ),
+    status: enumValue(enums.ConversionActionStatus, params.status ?? "ENABLED"),
+    include_in_conversions_metric:
+      params.include_in_conversions_metric ?? true,
+    counting_type: enumValue(
+      enums.ConversionActionCountingType,
+      params.counting_type ?? "ONE_PER_CLICK"
+    ),
+    primary_for_goal: params.primary_for_goal ?? true,
+    ...(params.default_value != null || params.currency_code
+      ? {
+          value_settings: {
+            default_value: params.default_value ?? 0,
+            default_currency_code: params.currency_code ?? "USD",
+            always_use_default_value:
+              params.always_use_default_value ?? false,
+          },
+        }
+      : {}),
+    ...(params.click_through_lookback_window_days != null
+      ? {
+          click_through_lookback_window_days:
+            params.click_through_lookback_window_days,
+        }
+      : {}),
+    ...(params.view_through_lookback_window_days != null
+      ? {
+          view_through_lookback_window_days:
+            params.view_through_lookback_window_days,
+        }
+      : {}),
+    ...(params.fields ?? {}),
+  };
+}
+
+function registerConversionActionAdminTools(server: McpServer) {
+  registerCollectionMutateTool({
+    server,
+    name: "update_conversion_action",
+    title: "Update Conversion Action",
+    description: "Update raw mutable ConversionAction fields.",
+    collection: "conversionActions",
+    action: "update",
+    resourceLabel: "Conversion action",
+  });
+
+  registerCollectionMutateTool({
+    server,
+    name: "remove_conversion_action",
+    title: "Remove Conversion Action",
+    description: "Irreversibly remove conversion actions.",
+    collection: "conversionActions",
+    action: "remove",
+    resourceLabel: "Conversion action",
+  });
+}
+
+function registerGoalTools(server: McpServer) {
+  registerGoalQueryTool(
+    server,
+    "list_customer_conversion_goals",
+    "customer_conversion_goal",
+    [
+      "customer_conversion_goal.resource_name",
+      "customer_conversion_goal.category",
+      "customer_conversion_goal.origin",
+      "customer_conversion_goal.biddable",
+    ]
+  );
+  registerCollectionMutateTool({
+    server,
+    name: "update_customer_conversion_goal",
+    title: "Update Customer Conversion Goal",
+    description: "Update customer conversion goals.",
+    collection: "customerConversionGoals",
+    action: "update",
+    resourceLabel: "Customer conversion goal",
+  });
+  registerSetCustomerConversionGoalBiddable(server);
+  registerGoalQueryTool(
+    server,
+    "list_campaign_conversion_goals",
+    "campaign_conversion_goal",
+    [
+      "campaign_conversion_goal.resource_name",
+      "campaign_conversion_goal.campaign",
+      "campaign_conversion_goal.category",
+      "campaign_conversion_goal.origin",
+      "campaign_conversion_goal.biddable",
+    ]
+  );
+  registerCollectionMutateTool({
+    server,
+    name: "set_campaign_conversion_goals",
+    title: "Set Campaign Conversion Goals",
+    description: "Update campaign conversion goals.",
+    collection: "campaignConversionGoals",
+    action: "update",
+    resourceLabel: "Campaign conversion goal",
+  });
+  registerSetCampaignConversionGoalBiddable(server);
+  registerCollectionMutateTool({
+    server,
+    name: "create_custom_conversion_goal",
+    title: "Create Custom Conversion Goal",
+    description: "Create custom conversion goals.",
+    collection: "customConversionGoals",
+    action: "create",
+    resourceLabel: "Custom conversion goal",
+  });
+  registerCollectionMutateTool({
+    server,
+    name: "update_conversion_goal_campaign_config",
+    title: "Update Conversion Goal Campaign Config",
+    description: "Update conversion goal campaign configs.",
+    collection: "conversionGoalCampaignConfigs",
+    action: "update",
+    resourceLabel: "Conversion goal campaign config",
+  });
+}
+
+function registerSetCustomerConversionGoalBiddable(server: McpServer) {
+  server.registerTool(
+    "set_customer_conversion_goal_biddable",
+    {
+      title: "Set Customer Conversion Goal Biddable",
+      description:
+        "Enable or disable bidding for a customer conversion goal by category and origin.",
+      inputSchema: {
+        customer_id: z.string(),
+        category: z.enum(CONVERSION_ACTION_CATEGORIES),
+        origin: z.enum(CONVERSION_GOAL_ORIGINS).default("WEBSITE"),
+        biddable: z.boolean(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "set_customer_conversion_goal_biddable";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resourceName = buildCustomerConversionGoalResourceName(
+          params.customer_id,
+          params.category,
+          params.origin
+        );
+        const result = await customer.customerConversionGoals.update(
+          [{ resource_name: resourceName, biddable: params.biddable }] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+function registerSetCampaignConversionGoalBiddable(server: McpServer) {
+  server.registerTool(
+    "set_campaign_conversion_goal_biddable",
+    {
+      title: "Set Campaign Conversion Goal Biddable",
+      description:
+        "Enable or disable bidding for a campaign conversion goal by campaign, category, and origin.",
+      inputSchema: {
+        customer_id: z.string(),
+        campaign_id: z.string().describe("Campaign resource name or numeric ID."),
+        category: z.enum(CONVERSION_ACTION_CATEGORIES),
+        origin: z.enum(CONVERSION_GOAL_ORIGINS).default("WEBSITE"),
+        biddable: z.boolean(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "set_campaign_conversion_goal_biddable";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resourceName = buildCampaignConversionGoalResourceName(
+          params.customer_id,
+          params.campaign_id,
+          params.category,
+          params.origin
+        );
+        const result = await customer.campaignConversionGoals.update(
+          [{ resource_name: resourceName, biddable: params.biddable }] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildCustomerConversionGoalResourceName(
+  customerId: string,
+  category: (typeof CONVERSION_ACTION_CATEGORIES)[number],
+  origin: (typeof CONVERSION_GOAL_ORIGINS)[number]
+) {
+  return ResourceNames.customerConversionGoal(
+    customerId,
+    enumValue(enums.ConversionActionCategory, category),
+    enumValue(enums.ConversionOrigin, origin)
+  );
+}
+
+export function buildCampaignConversionGoalResourceName(
+  customerId: string,
+  campaignId: string,
+  category: (typeof CONVERSION_ACTION_CATEGORIES)[number],
+  origin: (typeof CONVERSION_GOAL_ORIGINS)[number]
+) {
+  return ResourceNames.campaignConversionGoal(
+    customerId,
+    resourceId(campaignId, "campaigns"),
+    enumValue(enums.ConversionActionCategory, category),
+    enumValue(enums.ConversionOrigin, origin)
+  );
+}
+
+function registerConversionValueTools(server: McpServer) {
+  registerCreateConversionCustomVariable(server);
+  registerCollectionMutateTool({
+    server,
+    name: "update_conversion_custom_variable",
+    title: "Update Conversion Custom Variable",
+    description: "Update conversion custom variables.",
+    collection: "conversionCustomVariables",
+    action: "update",
+    resourceLabel: "Conversion custom variable",
+  });
+  registerCreateConversionValueRule(server);
+  registerCollectionMutateTool({
+    server,
+    name: "update_conversion_value_rule",
+    title: "Update Conversion Value Rule",
+    description: "Update conversion value rules.",
+    collection: "conversionValueRules",
+    action: "update",
+    resourceLabel: "Conversion value rule",
+  });
+  registerCollectionMutateTool({
+    server,
+    name: "remove_conversion_value_rule",
+    title: "Remove Conversion Value Rule",
+    description: "Remove conversion value rules.",
+    collection: "conversionValueRules",
+    action: "remove",
+    resourceLabel: "Conversion value rule",
+  });
+}
+
+function registerCreateConversionCustomVariable(server: McpServer) {
+  server.registerTool(
+    "create_conversion_custom_variable",
+    {
+      title: "Create Conversion Custom Variable",
+      description:
+        "Create a conversion custom variable from typed fields. Use mutate_google_ads_resources for raw create payloads.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        tag: z.string().optional(),
+        status: z.enum(CONVERSION_CUSTOM_VARIABLE_STATUSES).optional(),
+        fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_conversion_custom_variable";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resource = buildConversionCustomVariableResource(params);
+        const result = await customer.conversionCustomVariables.create(
+          [resource] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: {
+            conversion_custom_variable: resource,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildConversionCustomVariableResource(
+  params: ConversionCustomVariableInput
+) {
+  return {
+    name: params.name,
+    ...(params.tag ? { tag: params.tag } : {}),
+    ...(params.status
+      ? {
+          status: enumValue(
+            enums.ConversionCustomVariableStatus,
+            params.status
+          ),
+        }
+      : {}),
+    ...(params.fields ?? {}),
+  };
+}
+
+function registerCreateConversionValueRule(server: McpServer) {
+  server.registerTool(
+    "create_conversion_value_rule",
+    {
+      title: "Create Conversion Value Rule",
+      description:
+        "Create a conversion value rule with typed action and common geo/device/audience conditions.",
+      inputSchema: {
+        customer_id: z.string(),
+        operation: z.enum(VALUE_RULE_OPERATIONS),
+        value: z.number().finite(),
+        status: z.enum(CONVERSION_VALUE_RULE_STATUSES).optional(),
+        geo_target_constant_ids: z.array(z.string()).optional(),
+        excluded_geo_target_constant_ids: z.array(z.string()).optional(),
+        geo_match_type: z.enum(VALUE_RULE_GEO_MATCH_TYPES).optional(),
+        excluded_geo_match_type: z.enum(VALUE_RULE_GEO_MATCH_TYPES).optional(),
+        device_types: z.array(z.enum(VALUE_RULE_DEVICE_TYPES)).optional(),
+        user_list_ids: z.array(z.string()).optional(),
+        user_interest_ids: z.array(z.string()).optional(),
+        fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_conversion_value_rule";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resource = buildConversionValueRuleResource(params);
+        const result = await customer.conversionValueRules.create(
+          [resource] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: {
+            conversion_value_rule: resource,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildConversionValueRuleResource(
+  params: ConversionValueRuleInput
+) {
+  const resource = {
+    action: {
+      operation: enumValue(enums.ValueRuleOperation, params.operation),
+      value: params.value,
+    },
+    status: enumValue(
+      enums.ConversionValueRuleStatus,
+      params.status ?? "ENABLED"
+    ),
+    ...buildConversionValueRuleConditions(params),
+    ...(params.fields ?? {}),
+  };
+  const hasCondition =
+    "geo_location_condition" in resource ||
+    "device_condition" in resource ||
+    "audience_condition" in resource ||
+    params.fields != null;
+  if (!hasCondition) {
+    throw new Error(
+      "Provide at least one geo/device/audience condition or raw fields for the value rule."
+    );
+  }
+  return resource;
+}
+
+function buildConversionValueRuleConditions(params: ConversionValueRuleInput) {
+  const conditions: Record<string, unknown> = {};
+  if (
+    params.geo_target_constant_ids?.length ||
+    params.excluded_geo_target_constant_ids?.length ||
+    params.geo_match_type ||
+    params.excluded_geo_match_type
+  ) {
+    conditions.geo_location_condition = {
+      ...(params.geo_target_constant_ids?.length
+        ? {
+            geo_target_constants: params.geo_target_constant_ids.map((id) =>
+              customerScopedConstant("geoTargetConstants", id)
+            ),
+          }
+        : {}),
+      ...(params.excluded_geo_target_constant_ids?.length
+        ? {
+            excluded_geo_target_constants:
+              params.excluded_geo_target_constant_ids.map((id) =>
+                customerScopedConstant("geoTargetConstants", id)
+              ),
+          }
+        : {}),
+      ...(params.geo_match_type
+        ? {
+            geo_match_type: enumValue(
+              enums.ValueRuleGeoLocationMatchType,
+              params.geo_match_type
+            ),
+          }
+        : {}),
+      ...(params.excluded_geo_match_type
+        ? {
+            excluded_geo_match_type: enumValue(
+              enums.ValueRuleGeoLocationMatchType,
+              params.excluded_geo_match_type
+            ),
+          }
+        : {}),
+    };
+  }
+  if (params.device_types?.length) {
+    conditions.device_condition = {
+      device_types: params.device_types.map((deviceType) =>
+        enumValue(enums.ValueRuleDeviceType, deviceType)
+      ),
+    };
+  }
+  if (params.user_list_ids?.length || params.user_interest_ids?.length) {
+    conditions.audience_condition = {
+      ...(params.user_list_ids?.length
+        ? {
+            user_lists: params.user_list_ids.map((id) =>
+              toResourceName(params.customer_id, "userLists", id)
+            ),
+          }
+        : {}),
+      ...(params.user_interest_ids?.length
+        ? {
+            user_interests: params.user_interest_ids.map((id) =>
+              customerScopedConstant("userInterests", id)
+            ),
+          }
+        : {}),
+    };
+  }
+  return conditions;
 }
 
 function registerValidateOfflineConversionPayload(server: McpServer) {
@@ -616,6 +1387,75 @@ function registerUploadClickConversions(server: McpServer) {
   );
 }
 
+function registerAdditionalUploadTools(server: McpServer) {
+  registerUploadRpcTool(
+    server,
+    "upload_call_conversions",
+    "uploadCallConversions",
+    "Upload call conversions through ConversionUploadService."
+  );
+
+  server.registerTool(
+    "upload_conversion_adjustments",
+    {
+      title: "Upload Conversion Adjustments",
+      description: "Upload conversion adjustments through ConversionAdjustmentUploadService.",
+      inputSchema: {
+        customer_id: z.string(),
+        request: jsonRecordSchema,
+      },
+    },
+    async (params) => {
+      const tool = "upload_conversion_adjustments";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result =
+          await customer.conversionAdjustmentUploads.uploadConversionAdjustments({
+            customer_id: params.customer_id,
+            ...params.request,
+          } as never);
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+
+  server.registerTool(
+    "check_offline_conversion_upload_capability",
+    {
+      title: "Check Offline Conversion Upload Capability",
+      description:
+        "Return the current Google offline-click upload cutoff warning and next integration step.",
+      inputSchema: {
+        customer_id: z.string(),
+      },
+    },
+    async (params) =>
+      mcpSuccess({
+        tool: "check_offline_conversion_upload_capability",
+        customer_id: params.customer_id,
+        warnings: [
+          "Since 2026-06-15, Google may reject new UploadClickConversions users with CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE. New integrations should use Data Manager API for offline/enhanced lead imports.",
+        ],
+        results: {
+          capability: "unknown_until_upload_or_google_allowlist_check",
+          recommended_path_for_new_offline_click_imports: "Data Manager API",
+          upload_tools_available: [
+            "upload_click_conversions",
+            "upload_call_conversions",
+            "upload_conversion_adjustments",
+          ],
+        },
+      })
+  );
+}
+
 function registerGetOfflineConversionDiagnostics(server: McpServer) {
   server.registerTool(
     "get_offline_conversion_diagnostics",
@@ -709,6 +1549,144 @@ function registerGetOfflineConversionDiagnostics(server: McpServer) {
         );
       } catch (err) {
         return mcpError("fetching offline conversion diagnostics", err);
+      }
+    }
+  );
+}
+
+function registerConversionDiagnostics(server: McpServer) {
+  server.registerTool(
+    "conversion_diagnostics_report",
+    {
+      title: "Conversion Diagnostics Report",
+      description:
+        "Report conversion action health, goal/bidding status, conversion metrics, and upload readiness.",
+      inputSchema: {
+        customer_id: z.string(),
+        date_range: z.string().optional().default("LAST_30_DAYS"),
+      },
+    },
+    async (params) => {
+      const tool = "conversion_diagnostics_report";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const conversionActions = await customer.query(`
+          SELECT
+            conversion_action.resource_name,
+            conversion_action.name,
+            conversion_action.status,
+            conversion_action.type,
+            conversion_action.category,
+            conversion_action.origin,
+            conversion_action.primary_for_goal,
+            conversion_action.include_in_conversions_metric,
+            conversion_action.counting_type,
+            metrics.conversions,
+            metrics.conversions_value
+          FROM conversion_action
+          WHERE segments.date DURING ${sanitizeEnum(params.date_range)}`);
+        const customerGoals = await customer.query(`
+          SELECT
+            customer_conversion_goal.resource_name,
+            customer_conversion_goal.category,
+            customer_conversion_goal.origin,
+            customer_conversion_goal.biddable
+          FROM customer_conversion_goal`);
+        const conversionCustomer = await fetchConversionTrackingSetting(
+          params.customer_id
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          results: {
+            date_range: params.date_range,
+            conversion_customer: conversionCustomer,
+            conversion_actions: conversionActions,
+            customer_goals: customerGoals,
+          },
+          warnings: [
+            "For offline click uploads, use get_offline_conversion_diagnostics for client/action-level upload summaries.",
+          ],
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+}
+
+function registerGoalQueryTool(
+  server: McpServer,
+  name: string,
+  resource: string,
+  fields: string[]
+) {
+  server.registerTool(
+    name,
+    {
+      title: name
+        .split("_")
+        .map((part) => part[0].toUpperCase() + part.slice(1))
+        .join(" "),
+      description: `List ${resource} rows.`,
+      inputSchema: {
+        customer_id: z.string(),
+        limit: z.number().int().positive().max(10000).optional(),
+      },
+    },
+    async (params) => {
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const query = `SELECT ${fields.join(", ")} FROM ${resource} LIMIT ${
+          params.limit ?? 1000
+        }`;
+        const rows = await customer.query(query);
+        return mcpSuccess({
+          tool: name,
+          customer_id: params.customer_id,
+          results: { query, rows },
+        });
+      } catch (err) {
+        return mcpJsonError(name, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+}
+
+function registerUploadRpcTool(
+  server: McpServer,
+  toolName: string,
+  method: "uploadCallConversions",
+  description: string
+) {
+  server.registerTool(
+    toolName,
+    {
+      title: toolName
+        .split("_")
+        .map((part) => part[0].toUpperCase() + part.slice(1))
+        .join(" "),
+      description,
+      inputSchema: {
+        customer_id: z.string(),
+        request: jsonRecordSchema,
+      },
+    },
+    async (params) => {
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.conversionUploads[method]({
+          customer_id: params.customer_id,
+          ...params.request,
+        } as never);
+        return mcpSuccess({
+          tool: toolName,
+          customer_id: params.customer_id,
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(toolName, err, { customer_id: params.customer_id });
       }
     }
   );
@@ -1319,6 +2297,12 @@ function parseCustomerId(resourceName: string | null) {
 function parseConversionActionId(value: string) {
   const match = CONVERSION_ACTION_RE.exec(value.trim());
   return match?.[2] ?? null;
+}
+
+function resourceId(idOrName: string, collection: string) {
+  const trimmed = idOrName.trim();
+  const match = new RegExp(`/${collection}/(\\d+)$`).exec(trimmed);
+  return match?.[1] ?? trimmed;
 }
 
 function parseGoogleDateTime(value: string) {
