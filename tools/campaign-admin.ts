@@ -28,6 +28,37 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const STATUS = z.enum(["ENABLED", "PAUSED", "REMOVED"]);
 const CAMPAIGN_STATUS = z.enum(["ENABLED", "PAUSED"]);
 
+export type SearchCampaignBundleInput = {
+  customer_id: string;
+  name: string;
+  daily_budget: number;
+  initial_status?: "PAUSED" | "ENABLED";
+  cpc_bid_ceiling?: number;
+  include_search_partners?: boolean;
+  include_display_network?: boolean;
+  start_date?: string;
+  end_date?: string;
+  ad_groups: Array<{
+    name: string;
+    cpc_bid?: number;
+    final_url: string;
+    headlines: string[];
+    descriptions: string[];
+    path1?: string;
+    path2?: string;
+    keywords?: Array<{
+      text: string;
+      match_type: "BROAD" | "PHRASE" | "EXACT";
+    }>;
+  }>;
+  negative_keywords?: Array<{
+    text: string;
+    match_type: "BROAD" | "PHRASE" | "EXACT";
+  }>;
+  geo_target_constant_ids?: string[];
+  language_constant_ids?: string[];
+};
+
 export function registerCampaignAdminTools(server: McpServer) {
   registerCampaignReadTools(server);
   registerCampaignMutateTools(server);
@@ -889,141 +920,7 @@ function registerSearchCampaignBundle(server: McpServer) {
       const tool = "create_search_campaign_bundle";
       try {
         const customer = getAdsClient(params.customer_id);
-        const cid = params.customer_id;
-        const budgetTmp = ResourceNames.campaignBudget(cid, "-1");
-        const campaignTmp = ResourceNames.campaign(cid, "-2");
-        const operations: MutateOperation<unknown>[] = [
-          {
-            entity: "campaign_budget",
-            operation: "create",
-            resource: {
-              resource_name: budgetTmp,
-              name: `${params.name} budget (${Date.now()})`,
-              amount_micros: toMicros(params.daily_budget),
-              delivery_method: enums.BudgetDeliveryMethod.STANDARD,
-              explicitly_shared: false,
-            },
-          },
-          {
-            entity: "campaign",
-            operation: "create",
-            resource: {
-              resource_name: campaignTmp,
-              name: params.name,
-              status: enumValue(
-                enums.CampaignStatus,
-                params.initial_status ?? "PAUSED"
-              ),
-              advertising_channel_type: enums.AdvertisingChannelType.SEARCH,
-              campaign_budget: budgetTmp,
-              contains_eu_political_advertising:
-                enums.EuPoliticalAdvertisingStatus
-                  .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
-              target_spend:
-                params.cpc_bid_ceiling != null
-                  ? {
-                      cpc_bid_ceiling_micros: toMicros(params.cpc_bid_ceiling),
-                    }
-                  : {},
-              network_settings: {
-                target_google_search: true,
-                target_search_network: params.include_search_partners ?? true,
-                target_content_network: params.include_display_network ?? false,
-                target_partner_search_network: false,
-              },
-              ...(params.start_date ? { start_date: params.start_date } : {}),
-              ...(params.end_date ? { end_date: params.end_date } : {}),
-            },
-          },
-        ];
-
-        params.ad_groups.forEach((group, index) => {
-          const adGroupTmp = ResourceNames.adGroup(cid, String(-10 - index));
-          operations.push({
-            entity: "ad_group",
-            operation: "create",
-            resource: {
-              resource_name: adGroupTmp,
-              name: group.name,
-              campaign: campaignTmp,
-              status: enums.AdGroupStatus.ENABLED,
-              type: enums.AdGroupType.SEARCH_STANDARD,
-              ...(group.cpc_bid != null
-                ? { cpc_bid_micros: toMicros(group.cpc_bid) }
-                : {}),
-            },
-          });
-          operations.push({
-            entity: "ad_group_ad",
-            operation: "create",
-            resource: {
-              ad_group: adGroupTmp,
-              status: enums.AdGroupAdStatus.ENABLED,
-              ad: {
-                final_urls: [group.final_url],
-                responsive_search_ad: {
-                  headlines: group.headlines.map((text) => ({ text })),
-                  descriptions: group.descriptions.map((text) => ({ text })),
-                  ...(group.path1 ? { path1: group.path1 } : {}),
-                  ...(group.path2 ? { path2: group.path2 } : {}),
-                },
-              },
-            },
-          });
-          for (const keyword of group.keywords ?? []) {
-            operations.push({
-              entity: "ad_group_criterion",
-              operation: "create",
-              resource: {
-                ad_group: adGroupTmp,
-                status: enums.AdGroupCriterionStatus.ENABLED,
-                keyword: {
-                  text: keyword.text,
-                  match_type: enumValue(enums.KeywordMatchType, keyword.match_type),
-                },
-              },
-            });
-          }
-        });
-
-        for (const keyword of params.negative_keywords ?? []) {
-          operations.push({
-            entity: "campaign_criterion",
-            operation: "create",
-            resource: {
-              campaign: campaignTmp,
-              negative: true,
-              keyword: {
-                text: keyword.text,
-                match_type: enumValue(enums.KeywordMatchType, keyword.match_type),
-              },
-            },
-          });
-        }
-        for (const id of params.geo_target_constant_ids ?? []) {
-          operations.push({
-            entity: "campaign_criterion",
-            operation: "create",
-            resource: {
-              campaign: campaignTmp,
-              location: {
-                geo_target_constant: customerScopedConstant("geoTargetConstants", id),
-              },
-            },
-          });
-        }
-        for (const id of params.language_constant_ids ?? []) {
-          operations.push({
-            entity: "campaign_criterion",
-            operation: "create",
-            resource: {
-              campaign: campaignTmp,
-              language: {
-                language_constant: customerScopedConstant("languageConstants", id),
-              },
-            },
-          });
-        }
+        const operations = buildSearchCampaignBundleOperations(params);
 
         const result = await customer.mutateResources(operations, {
           validate_only: params.validate_only ?? false,
@@ -1047,6 +944,141 @@ function registerSearchCampaignBundle(server: McpServer) {
       }
     }
   );
+}
+
+export function buildSearchCampaignBundleOperations(
+  params: SearchCampaignBundleInput
+): MutateOperation<unknown>[] {
+  const cid = params.customer_id;
+  const budgetTmp = ResourceNames.campaignBudget(cid, "-1");
+  const campaignTmp = ResourceNames.campaign(cid, "-2");
+  const operations: MutateOperation<unknown>[] = [
+    {
+      entity: "campaign_budget",
+      operation: "create",
+      resource: {
+        resource_name: budgetTmp,
+        name: `${params.name} budget`,
+        amount_micros: toMicros(params.daily_budget),
+        delivery_method: enums.BudgetDeliveryMethod.STANDARD,
+        explicitly_shared: false,
+      },
+    },
+    {
+      entity: "campaign",
+      operation: "create",
+      resource: {
+        resource_name: campaignTmp,
+        name: params.name,
+        status: enumValue(enums.CampaignStatus, params.initial_status ?? "PAUSED"),
+        advertising_channel_type: enums.AdvertisingChannelType.SEARCH,
+        campaign_budget: budgetTmp,
+        contains_eu_political_advertising:
+          enums.EuPoliticalAdvertisingStatus
+            .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
+        target_spend:
+          params.cpc_bid_ceiling != null
+            ? { cpc_bid_ceiling_micros: toMicros(params.cpc_bid_ceiling) }
+            : {},
+        network_settings: {
+          target_google_search: true,
+          target_search_network: params.include_search_partners ?? true,
+          target_content_network: params.include_display_network ?? false,
+          target_partner_search_network: false,
+        },
+        ...(params.start_date ? { start_date: params.start_date } : {}),
+        ...(params.end_date ? { end_date: params.end_date } : {}),
+      },
+    },
+  ];
+
+  params.ad_groups.forEach((group, index) => {
+    const adGroupTmp = ResourceNames.adGroup(cid, String(-10 - index));
+    operations.push({
+      entity: "ad_group",
+      operation: "create",
+      resource: {
+        resource_name: adGroupTmp,
+        name: group.name,
+        campaign: campaignTmp,
+        status: enums.AdGroupStatus.ENABLED,
+        type: enums.AdGroupType.SEARCH_STANDARD,
+        ...(group.cpc_bid != null ? { cpc_bid_micros: toMicros(group.cpc_bid) } : {}),
+      },
+    });
+    operations.push({
+      entity: "ad_group_ad",
+      operation: "create",
+      resource: {
+        ad_group: adGroupTmp,
+        status: enums.AdGroupAdStatus.ENABLED,
+        ad: {
+          final_urls: [group.final_url],
+          responsive_search_ad: {
+            headlines: group.headlines.map((text) => ({ text })),
+            descriptions: group.descriptions.map((text) => ({ text })),
+            ...(group.path1 ? { path1: group.path1 } : {}),
+            ...(group.path2 ? { path2: group.path2 } : {}),
+          },
+        },
+      },
+    });
+    for (const keyword of group.keywords ?? []) {
+      operations.push({
+        entity: "ad_group_criterion",
+        operation: "create",
+        resource: {
+          ad_group: adGroupTmp,
+          status: enums.AdGroupCriterionStatus.ENABLED,
+          keyword: {
+            text: keyword.text,
+            match_type: enumValue(enums.KeywordMatchType, keyword.match_type),
+          },
+        },
+      });
+    }
+  });
+
+  for (const keyword of params.negative_keywords ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign: campaignTmp,
+        negative: true,
+        keyword: {
+          text: keyword.text,
+          match_type: enumValue(enums.KeywordMatchType, keyword.match_type),
+        },
+      },
+    });
+  }
+  for (const id of params.geo_target_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign: campaignTmp,
+        location: {
+          geo_target_constant: customerScopedConstant("geoTargetConstants", id),
+        },
+      },
+    });
+  }
+  for (const id of params.language_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign: campaignTmp,
+        language: {
+          language_constant: customerScopedConstant("languageConstants", id),
+        },
+      },
+    });
+  }
+
+  return operations;
 }
 
 function registerChannelCampaignBundleTools(server: McpServer) {

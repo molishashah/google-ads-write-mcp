@@ -111,3 +111,75 @@ export function asArray<T>(value: T | T[] | undefined): T[] {
   if (value == null) return [];
   return Array.isArray(value) ? value : [value];
 }
+
+export type MetricSummary = {
+  row_count: number;
+  totals: {
+    impressions: number;
+    clicks: number;
+    cost_micros: number;
+    cost: number;
+    conversions: number;
+    conversions_value: number;
+  };
+  derived: {
+    ctr: number | null;
+    average_cpc: number | null;
+    conversion_rate: number | null;
+    cost_per_conversion: number | null;
+    conversion_value_per_cost: number | null;
+  };
+};
+
+export function microsToCurrency(micros: number) {
+  return micros / 1_000_000;
+}
+
+export function summarizeMetricRows(rows: unknown[]): MetricSummary {
+  const totals = {
+    impressions: 0,
+    clicks: 0,
+    cost_micros: 0,
+    cost: 0,
+    conversions: 0,
+    conversions_value: 0,
+  };
+
+  for (const row of rows) {
+    const metrics =
+      row && typeof row === "object"
+        ? (row as { metrics?: Record<string, unknown> }).metrics
+        : undefined;
+    if (!metrics) continue;
+    totals.impressions += toNumber(metrics.impressions);
+    totals.clicks += toNumber(metrics.clicks);
+    totals.cost_micros += toNumber(metrics.cost_micros);
+    totals.conversions += toNumber(metrics.conversions);
+    totals.conversions_value += toNumber(metrics.conversions_value);
+  }
+  totals.cost = microsToCurrency(totals.cost_micros);
+
+  return {
+    row_count: rows.length,
+    totals,
+    derived: {
+      ctr: totals.impressions > 0 ? totals.clicks / totals.impressions : null,
+      average_cpc: totals.clicks > 0 ? totals.cost / totals.clicks : null,
+      conversion_rate:
+        totals.clicks > 0 ? totals.conversions / totals.clicks : null,
+      cost_per_conversion:
+        totals.conversions > 0 ? totals.cost / totals.conversions : null,
+      conversion_value_per_cost:
+        totals.cost > 0 ? totals.conversions_value / totals.cost : null,
+    },
+  };
+}
+
+function toNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}

@@ -4,6 +4,7 @@ import {
   escapeGaql,
   extractRequestId,
   extractResourceNames,
+  summarizeMetricRows,
   quoteGaql,
   toResourceName,
 } from "./google-ads-utils";
@@ -71,6 +72,48 @@ describe("google ads helpers", () => {
       tool: "example",
       customer_id: "123",
       results: { ok: true },
+    });
+  });
+
+  it("summarizes Google Ads metric rows", () => {
+    expect(
+      summarizeMetricRows([
+        {
+          metrics: {
+            impressions: 100,
+            clicks: 10,
+            cost_micros: 2_500_000,
+            conversions: 2,
+            conversions_value: 20,
+          },
+        },
+        {
+          metrics: {
+            impressions: "50",
+            clicks: "5",
+            cost_micros: "500000",
+            conversions: "1",
+            conversions_value: "5",
+          },
+        },
+      ])
+    ).toEqual({
+      row_count: 2,
+      totals: {
+        impressions: 150,
+        clicks: 15,
+        cost_micros: 3_000_000,
+        cost: 3,
+        conversions: 3,
+        conversions_value: 25,
+      },
+      derived: {
+        ctr: 0.1,
+        average_cpc: 0.2,
+        conversion_rate: 0.2,
+        cost_per_conversion: 1,
+        conversion_value_per_cost: 25 / 3,
+      },
     });
   });
 });

@@ -1,7 +1,11 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
-import { buildGaqlQuery, extractRequestId } from "@/lib/google-ads-utils";
+import {
+  buildGaqlQuery,
+  extractRequestId,
+  summarizeMetricRows,
+} from "@/lib/google-ads-utils";
 import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
 import { jsonRecordSchema } from "@/tools/tool-utils";
 
@@ -45,7 +49,12 @@ function registerReportTools(server: McpServer) {
           return mcpSuccess({
             tool,
             customer_id: params.customer_id,
-            results: { query, rows },
+            results: {
+              query,
+              row_count: Array.isArray(rows) ? rows.length : null,
+              summary: Array.isArray(rows) ? summarizeMetricRows(rows) : null,
+              rows,
+            },
           });
         } catch (err) {
           return mcpJsonError(tool, err, { customer_id: params.customer_id });
