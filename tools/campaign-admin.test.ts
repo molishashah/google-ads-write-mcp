@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { enums } from "google-ads-api";
-import { buildSearchCampaignBundleOperations } from "./campaign-admin";
+import {
+  buildPerformanceMaxCampaignBundleOperations,
+  buildSearchCampaignBundleOperations,
+} from "./campaign-admin";
 
 describe("buildSearchCampaignBundleOperations", () => {
   it("builds one atomic Search campaign bundle with temp resource names", () => {
@@ -60,6 +63,55 @@ describe("buildSearchCampaignBundleOperations", () => {
           path1: "core",
         },
       },
+    });
+  });
+
+  it("builds one atomic Performance Max campaign bundle with asset group links", () => {
+    const operations = buildPerformanceMaxCampaignBundleOperations({
+      customer_id: "123",
+      name: "PMax Test",
+      daily_budget: 50,
+      initial_status: "PAUSED",
+      target_roas: 2.5,
+      final_url_expansion_opt_out: true,
+      asset_group: {
+        name: "Core assets",
+        final_urls: ["https://example.com"],
+        assets: [
+          { asset_id: "111", field_type: "MARKETING_IMAGE" },
+          { asset_id: "customers/123/assets/222", field_type: "HEADLINE" },
+        ],
+      },
+      geo_target_constant_ids: ["2840"],
+      language_constant_ids: ["1000"],
+    });
+
+    expect(operations.map((operation) => operation.entity)).toEqual([
+      "campaign_budget",
+      "campaign",
+      "asset_group",
+      "asset_group_asset",
+      "asset_group_asset",
+      "campaign_criterion",
+      "campaign_criterion",
+    ]);
+    expect(operations[1].resource).toMatchObject({
+      resource_name: "customers/123/campaigns/-2",
+      advertising_channel_type: enums.AdvertisingChannelType.PERFORMANCE_MAX,
+      campaign_budget: "customers/123/campaignBudgets/-1",
+      maximize_conversion_value: { target_roas: 2.5 },
+      url_expansion_opt_out: true,
+    });
+    expect(operations[2].resource).toMatchObject({
+      resource_name: "customers/123/assetGroups/-3",
+      campaign: "customers/123/campaigns/-2",
+      final_urls: ["https://example.com"],
+      status: enums.AssetGroupStatus.PAUSED,
+    });
+    expect(operations[3].resource).toMatchObject({
+      asset_group: "customers/123/assetGroups/-3",
+      asset: "customers/123/assets/111",
+      field_type: enums.AssetFieldType.MARKETING_IMAGE,
     });
   });
 });

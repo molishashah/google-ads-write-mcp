@@ -8,6 +8,7 @@ import {
   extractRequestId,
   extractResourceNames,
   toResourceName,
+  type JsonRecord,
 } from "@/lib/google-ads-utils";
 import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
 import {
@@ -22,6 +23,37 @@ export function registerAssetAndAdTools(server: McpServer) {
   registerAdFormatTools(server);
   registerPolicyTools(server);
 }
+
+export type ResponsiveDisplayAdInput = {
+  customer_id: string;
+  ad_group_id: string;
+  final_urls: string[];
+  final_mobile_urls?: string[];
+  headlines: string[];
+  long_headline: string;
+  descriptions: string[];
+  business_name: string;
+  marketing_image_asset_ids: string[];
+  square_marketing_image_asset_ids?: string[];
+  logo_image_asset_ids?: string[];
+  square_logo_image_asset_ids?: string[];
+  youtube_video_asset_ids?: string[];
+  main_color?: string;
+  accent_color?: string;
+  allow_flexible_color?: boolean;
+  call_to_action_text?: string;
+  price_prefix?: string;
+  promo_text?: string;
+  format_setting?: "ALL_FORMATS" | "NON_NATIVE" | "NATIVE";
+  enable_asset_enhancements?: boolean;
+  enable_autogen_video?: boolean;
+  tracking_url_template?: string;
+  final_url_suffix?: string;
+  url_custom_parameters?: Array<{ key: string; value: string }>;
+  ad_fields?: JsonRecord;
+  responsive_display_ad_fields?: JsonRecord;
+  status?: "ENABLED" | "PAUSED";
+};
 
 function registerAssetTools(server: McpServer) {
   server.registerTool(
@@ -159,12 +191,7 @@ function registerAdFormatTools(server: McpServer) {
     description:
       "Create an AdGroupAd using a raw Google Ads ad payload. Use for ad subtypes not covered by a specialized tool.",
   });
-  registerRawAdTool(server, {
-    name: "create_responsive_display_ad",
-    title: "Create Responsive Display Ad",
-    description:
-      "Create a Responsive Display Ad. Pass the responsive_display_ad payload under ad.responsive_display_ad.",
-  });
+  registerCreateResponsiveDisplayAd(server);
   registerRawAdTool(server, {
     name: "create_demand_gen_ad",
     title: "Create Demand Gen Ad",
@@ -308,6 +335,175 @@ function registerPolicyTools(server: McpServer) {
       }
     }
   );
+}
+
+function registerCreateResponsiveDisplayAd(server: McpServer) {
+  server.registerTool(
+    "create_responsive_display_ad",
+    {
+      title: "Create Responsive Display Ad",
+      description:
+        "Create a Responsive Display Ad from typed copy and asset IDs. Use create_ad_group_ad for raw ad payloads.",
+      inputSchema: {
+        customer_id: z.string(),
+        ad_group_id: z.string().describe("Ad group resource name or numeric ID."),
+        final_urls: z.array(z.string().url()).min(1),
+        final_mobile_urls: z.array(z.string().url()).optional(),
+        headlines: z.array(z.string().max(30)).min(1).max(5),
+        long_headline: z.string().max(90),
+        descriptions: z.array(z.string().max(90)).min(1).max(5),
+        business_name: z.string().max(25),
+        marketing_image_asset_ids: z.array(z.string()).min(1),
+        square_marketing_image_asset_ids: z.array(z.string()).optional(),
+        logo_image_asset_ids: z.array(z.string()).optional(),
+        square_logo_image_asset_ids: z.array(z.string()).optional(),
+        youtube_video_asset_ids: z.array(z.string()).optional(),
+        main_color: z.string().optional(),
+        accent_color: z.string().optional(),
+        allow_flexible_color: z.boolean().optional(),
+        call_to_action_text: z.string().optional(),
+        price_prefix: z.string().optional(),
+        promo_text: z.string().optional(),
+        format_setting: z.enum(["ALL_FORMATS", "NON_NATIVE", "NATIVE"]).optional(),
+        enable_asset_enhancements: z.boolean().optional(),
+        enable_autogen_video: z.boolean().optional(),
+        tracking_url_template: z.string().optional(),
+        final_url_suffix: z.string().optional(),
+        url_custom_parameters: z
+          .array(z.object({ key: z.string(), value: z.string() }))
+          .optional(),
+        ad_fields: jsonRecordSchema.optional(),
+        responsive_display_ad_fields: jsonRecordSchema.optional(),
+        status: z.enum(["ENABLED", "PAUSED"]).optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_responsive_display_ad";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.adGroupAds.create(
+          [buildResponsiveDisplayAdResource(params)],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildResponsiveDisplayAdResource(
+  params: ResponsiveDisplayAdInput
+): JsonRecord {
+  const responsiveDisplayAd: JsonRecord = {
+    marketing_images: toAssetRefs(
+      params.customer_id,
+      params.marketing_image_asset_ids
+    ),
+    headlines: params.headlines.map((text) => ({ text })),
+    long_headline: { text: params.long_headline },
+    descriptions: params.descriptions.map((text) => ({ text })),
+    business_name: params.business_name,
+    ...(params.square_marketing_image_asset_ids?.length
+      ? {
+          square_marketing_images: toAssetRefs(
+            params.customer_id,
+            params.square_marketing_image_asset_ids
+          ),
+        }
+      : {}),
+    ...(params.logo_image_asset_ids?.length
+      ? {
+          logo_images: toAssetRefs(params.customer_id, params.logo_image_asset_ids),
+        }
+      : {}),
+    ...(params.square_logo_image_asset_ids?.length
+      ? {
+          square_logo_images: toAssetRefs(
+            params.customer_id,
+            params.square_logo_image_asset_ids
+          ),
+        }
+      : {}),
+    ...(params.youtube_video_asset_ids?.length
+      ? {
+          youtube_videos: toAssetRefs(
+            params.customer_id,
+            params.youtube_video_asset_ids
+          ),
+        }
+      : {}),
+    ...(params.main_color ? { main_color: params.main_color } : {}),
+    ...(params.accent_color ? { accent_color: params.accent_color } : {}),
+    ...(params.allow_flexible_color != null
+      ? { allow_flexible_color: params.allow_flexible_color }
+      : {}),
+    ...(params.call_to_action_text
+      ? { call_to_action_text: params.call_to_action_text }
+      : {}),
+    ...(params.price_prefix ? { price_prefix: params.price_prefix } : {}),
+    ...(params.promo_text ? { promo_text: params.promo_text } : {}),
+    ...(params.format_setting
+      ? {
+          format_setting: enumValue(
+            enums.DisplayAdFormatSetting,
+            params.format_setting
+          ),
+        }
+      : {}),
+    ...(params.enable_asset_enhancements != null ||
+    params.enable_autogen_video != null
+      ? {
+          control_spec: {
+            ...(params.enable_asset_enhancements != null
+              ? { enable_asset_enhancements: params.enable_asset_enhancements }
+              : {}),
+            ...(params.enable_autogen_video != null
+              ? { enable_autogen_video: params.enable_autogen_video }
+              : {}),
+          },
+        }
+      : {}),
+    ...(params.responsive_display_ad_fields ?? {}),
+  };
+
+  return {
+    ad_group: toResourceName(params.customer_id, "adGroups", params.ad_group_id),
+    status: enumValue(enums.AdGroupAdStatus, params.status ?? "ENABLED"),
+    ad: {
+      final_urls: params.final_urls,
+      ...(params.final_mobile_urls ? { final_mobile_urls: params.final_mobile_urls } : {}),
+      ...(params.tracking_url_template
+        ? { tracking_url_template: params.tracking_url_template }
+        : {}),
+      ...(params.final_url_suffix
+        ? { final_url_suffix: params.final_url_suffix }
+        : {}),
+      ...(params.url_custom_parameters
+        ? { url_custom_parameters: params.url_custom_parameters }
+        : {}),
+      responsive_display_ad: responsiveDisplayAd,
+      ...(params.ad_fields ?? {}),
+    },
+  };
+}
+
+function toAssetRefs(customerId: string, assetIds: string[]) {
+  return assetIds.map((assetId) => ({
+    asset: toResourceName(customerId, "assets", assetId),
+  }));
 }
 
 function registerRawAdTool(

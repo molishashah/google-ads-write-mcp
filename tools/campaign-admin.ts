@@ -59,6 +59,33 @@ export type SearchCampaignBundleInput = {
   language_constant_ids?: string[];
 };
 
+export type PerformanceMaxCampaignBundleInput = {
+  customer_id: string;
+  name: string;
+  daily_budget: number;
+  initial_status?: "PAUSED" | "ENABLED";
+  bidding_strategy?: "MAXIMIZE_CONVERSIONS" | "MAXIMIZE_CONVERSION_VALUE";
+  target_cpa?: number;
+  target_roas?: number;
+  start_date?: string;
+  end_date?: string;
+  final_url_expansion_opt_out?: boolean;
+  campaign_fields?: JsonRecord;
+  asset_group: {
+    name: string;
+    final_urls: string[];
+    final_mobile_urls?: string[];
+    status?: "PAUSED" | "ENABLED";
+    assets?: Array<{
+      asset_id: string;
+      field_type: string;
+    }>;
+    fields?: JsonRecord;
+  };
+  geo_target_constant_ids?: string[];
+  language_constant_ids?: string[];
+};
+
 export function registerCampaignAdminTools(server: McpServer) {
   registerCampaignReadTools(server);
   registerCampaignMutateTools(server);
@@ -1082,12 +1109,9 @@ export function buildSearchCampaignBundleOperations(
 }
 
 function registerChannelCampaignBundleTools(server: McpServer) {
+  registerPerformanceMaxCampaignBundle(server);
+
   const tools = [
-    {
-      name: "create_performance_max_campaign_bundle",
-      title: "Create Performance Max Campaign Bundle",
-      channel: "PERFORMANCE_MAX",
-    },
     {
       name: "create_demand_gen_campaign_bundle",
       title: "Create Demand Gen Campaign Bundle",
@@ -1185,6 +1209,225 @@ function registerChannelCampaignBundleTools(server: McpServer) {
       }
     );
   }
+}
+
+function registerPerformanceMaxCampaignBundle(server: McpServer) {
+  server.registerTool(
+    "create_performance_max_campaign_bundle",
+    {
+      title: "Create Performance Max Campaign Bundle",
+      description:
+        "Atomically create a Performance Max campaign with budget, campaign, asset group, asset links, and basic geo/language criteria.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        daily_budget: z.number().positive(),
+        initial_status: CAMPAIGN_STATUS.optional(),
+        bidding_strategy: z
+          .enum(["MAXIMIZE_CONVERSIONS", "MAXIMIZE_CONVERSION_VALUE"])
+          .optional(),
+        target_cpa: z.number().positive().optional(),
+        target_roas: z.number().positive().optional(),
+        start_date: z.string().regex(DATE_RE).optional(),
+        end_date: z.string().regex(DATE_RE).optional(),
+        final_url_expansion_opt_out: z.boolean().optional(),
+        campaign_fields: jsonRecordSchema.optional(),
+        asset_group: z.object({
+          name: z.string().min(1),
+          final_urls: z.array(z.string().url()).min(1),
+          final_mobile_urls: z.array(z.string().url()).optional(),
+          status: CAMPAIGN_STATUS.optional(),
+          assets: z
+            .array(
+              z.object({
+                asset_id: z.string().describe("Asset resource name or numeric ID."),
+                field_type: z
+                  .enum([
+                    "HEADLINE",
+                    "LONG_HEADLINE",
+                    "DESCRIPTION",
+                    "MARKETING_IMAGE",
+                    "SQUARE_MARKETING_IMAGE",
+                    "PORTRAIT_MARKETING_IMAGE",
+                    "LOGO",
+                    "LANDSCAPE_LOGO",
+                    "VIDEO",
+                    "BUSINESS_NAME",
+                    "CALL_TO_ACTION_SELECTION",
+                    "SITELINK",
+                    "CALLOUT",
+                    "PROMOTION",
+                    "PRICE",
+                    "LEAD_FORM",
+                  ])
+                  .describe("AssetFieldType used for the AssetGroupAsset link."),
+              })
+            )
+            .optional(),
+          fields: jsonRecordSchema.optional(),
+        }),
+        geo_target_constant_ids: z.array(z.string()).optional(),
+        language_constant_ids: z.array(z.string()).optional(),
+        validate_only: z.boolean().optional(),
+      },
+    },
+    async (params) => {
+      const tool = "create_performance_max_campaign_bundle";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const operations = buildPerformanceMaxCampaignBundleOperations(params);
+        const result = await customer.mutateResources(operations, {
+          validate_only: params.validate_only ?? false,
+        });
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: {
+            operation_count: operations.length,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildPerformanceMaxCampaignBundleOperations(
+  params: PerformanceMaxCampaignBundleInput
+): MutateOperation<unknown>[] {
+  const cid = params.customer_id;
+  const budgetTmp = ResourceNames.campaignBudget(cid, "-1");
+  const campaignTmp = ResourceNames.campaign(cid, "-2");
+  const assetGroupTmp = ResourceNames.assetGroup(cid, "-3");
+  const operations: MutateOperation<unknown>[] = [
+    {
+      entity: "campaign_budget",
+      operation: "create",
+      resource: {
+        resource_name: budgetTmp,
+        name: `${params.name} budget`,
+        amount_micros: toMicros(params.daily_budget),
+        delivery_method: enums.BudgetDeliveryMethod.STANDARD,
+        explicitly_shared: false,
+      },
+    },
+    {
+      entity: "campaign",
+      operation: "create",
+      resource: {
+        resource_name: campaignTmp,
+        name: params.name,
+        status: enumValue(enums.CampaignStatus, params.initial_status ?? "PAUSED"),
+        advertising_channel_type: enums.AdvertisingChannelType.PERFORMANCE_MAX,
+        campaign_budget: budgetTmp,
+        contains_eu_political_advertising:
+          enums.EuPoliticalAdvertisingStatus
+            .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
+        ...buildPerformanceMaxBiddingStrategy(params),
+        ...(params.final_url_expansion_opt_out != null
+          ? { url_expansion_opt_out: params.final_url_expansion_opt_out }
+          : {}),
+        ...(params.start_date ? { start_date: params.start_date } : {}),
+        ...(params.end_date ? { end_date: params.end_date } : {}),
+        ...(params.campaign_fields ?? {}),
+      },
+    },
+    {
+      entity: "asset_group",
+      operation: "create",
+      resource: {
+        resource_name: assetGroupTmp,
+        campaign: campaignTmp,
+        name: params.asset_group.name,
+        final_urls: params.asset_group.final_urls,
+        status: enumValue(
+          enums.AssetGroupStatus,
+          params.asset_group.status ?? params.initial_status ?? "PAUSED"
+        ),
+        ...(params.asset_group.final_mobile_urls
+          ? { final_mobile_urls: params.asset_group.final_mobile_urls }
+          : {}),
+        ...(params.asset_group.fields ?? {}),
+      },
+    },
+  ];
+
+  for (const asset of params.asset_group.assets ?? []) {
+    operations.push({
+      entity: "asset_group_asset",
+      operation: "create",
+      resource: {
+        asset_group: assetGroupTmp,
+        asset: toResourceName(cid, "assets", asset.asset_id),
+        field_type: enumValue(enums.AssetFieldType, asset.field_type),
+      },
+    });
+  }
+  for (const id of params.geo_target_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign: campaignTmp,
+        location: {
+          geo_target_constant: customerScopedConstant("geoTargetConstants", id),
+        },
+      },
+    });
+  }
+  for (const id of params.language_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign: campaignTmp,
+        language: {
+          language_constant: customerScopedConstant("languageConstants", id),
+        },
+      },
+    });
+  }
+
+  return operations;
+}
+
+function buildPerformanceMaxBiddingStrategy(
+  params: Pick<
+    PerformanceMaxCampaignBundleInput,
+    "bidding_strategy" | "target_cpa" | "target_roas"
+  >
+) {
+  const strategy =
+    params.bidding_strategy ??
+    (params.target_roas != null
+      ? "MAXIMIZE_CONVERSION_VALUE"
+      : "MAXIMIZE_CONVERSIONS");
+  if (strategy === "MAXIMIZE_CONVERSIONS") {
+    if (params.target_roas != null) {
+      throw new Error("target_roas requires MAXIMIZE_CONVERSION_VALUE bidding.");
+    }
+    return {
+      maximize_conversions:
+        params.target_cpa != null
+          ? { target_cpa_micros: toMicros(params.target_cpa) }
+          : {},
+    };
+  }
+  if (params.target_cpa != null) {
+    throw new Error("target_cpa requires MAXIMIZE_CONVERSIONS bidding.");
+  }
+  return {
+    maximize_conversion_value:
+      params.target_roas != null ? { target_roas: params.target_roas } : {},
+  };
 }
 
 async function resolveCampaignBudget(

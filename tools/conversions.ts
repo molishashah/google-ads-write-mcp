@@ -1,5 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { enums, services } from "google-ads-api";
+import { enums, ResourceNames, services } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
 import {
@@ -30,6 +30,50 @@ const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
 const SHA256_HEX_ANY_CASE_RE = /^[a-fA-F0-9]{64}$/;
 const ENUM_RE = /^[A-Z][A-Z0-9_]*$/;
 const DEFAULT_CONVERSION_WINDOW_DAYS = 90;
+const CONVERSION_ACTION_CATEGORIES = [
+  "DEFAULT",
+  "PAGE_VIEW",
+  "PURCHASE",
+  "SIGNUP",
+  "DOWNLOAD",
+  "ADD_TO_CART",
+  "BEGIN_CHECKOUT",
+  "SUBSCRIBE_PAID",
+  "PHONE_CALL_LEAD",
+  "IMPORTED_LEAD",
+  "SUBMIT_LEAD_FORM",
+  "BOOK_APPOINTMENT",
+  "REQUEST_QUOTE",
+  "GET_DIRECTIONS",
+  "OUTBOUND_CLICK",
+  "CONTACT",
+  "ENGAGEMENT",
+  "STORE_VISIT",
+  "STORE_SALE",
+  "QUALIFIED_LEAD",
+  "CONVERTED_LEAD",
+  "YOUTUBE_FOLLOW_ON_VIEWS",
+] as const;
+const CONVERSION_GOAL_ORIGINS = [
+  "WEBSITE",
+  "GOOGLE_HOSTED",
+  "APP",
+  "CALL_FROM_ADS",
+  "STORE",
+  "YOUTUBE_HOSTED",
+] as const;
+const CONVERSION_ACTION_TYPES = [
+  "WEBPAGE",
+  "UPLOAD_CLICKS",
+  "UPLOAD_CALLS",
+  "AD_CALL",
+  "CLICK_TO_CALL",
+  "WEBSITE_CALL",
+  "STORE_SALES",
+  "STORE_SALES_DIRECT_UPLOAD",
+  "GOOGLE_HOSTED",
+  "LEAD_FORM_SUBMIT",
+] as const;
 
 type ErrorClass =
   | "config"
@@ -88,6 +132,22 @@ type RawClickConversion = {
   conversion_environment?: NormalizedClickConversion["conversionEnvironment"];
   customerType?: NormalizedClickConversion["customerType"];
   customer_type?: NormalizedClickConversion["customerType"];
+};
+
+export type ConversionActionSetupInput = {
+  name: string;
+  type: (typeof CONVERSION_ACTION_TYPES)[number];
+  category?: (typeof CONVERSION_ACTION_CATEGORIES)[number];
+  status?: "ENABLED" | "REMOVED" | "HIDDEN";
+  include_in_conversions_metric?: boolean;
+  counting_type?: "ONE_PER_CLICK" | "MANY_PER_CLICK";
+  primary_for_goal?: boolean;
+  default_value?: number;
+  currency_code?: string;
+  always_use_default_value?: boolean;
+  click_through_lookback_window_days?: number;
+  view_through_lookback_window_days?: number;
+  fields?: Record<string, unknown>;
 };
 
 type GoogleAdsFailureLike = {
@@ -163,6 +223,7 @@ export function registerConversionTools(server: McpServer) {
   registerListConversionActions(server);
   registerGetConversionAction(server);
   registerCreateConversionAction(server);
+  registerTypedConversionSetupTools(server);
   registerConversionActionAdminTools(server);
   registerGoalTools(server);
   registerConversionValueTools(server);
@@ -512,6 +573,135 @@ function registerCreateConversionAction(server: McpServer) {
   );
 }
 
+function registerTypedConversionSetupTools(server: McpServer) {
+  registerTypedConversionActionTool(server, {
+    name: "create_offline_conversion_action",
+    title: "Create Offline Conversion Action",
+    description:
+      "Create an offline click conversion action for UploadClickConversions / enhanced conversions for leads.",
+    type: "UPLOAD_CLICKS",
+    defaultCategory: "IMPORTED_LEAD",
+  });
+  registerTypedConversionActionTool(server, {
+    name: "create_website_conversion_action",
+    title: "Create Website Conversion Action",
+    description: "Create a website conversion action for Google tag / webpage tracking.",
+    type: "WEBPAGE",
+    defaultCategory: "PAGE_VIEW",
+  });
+}
+
+function registerTypedConversionActionTool(
+  server: McpServer,
+  config: {
+    name: string;
+    title: string;
+    description: string;
+    type: (typeof CONVERSION_ACTION_TYPES)[number];
+    defaultCategory: (typeof CONVERSION_ACTION_CATEGORIES)[number];
+  }
+) {
+  server.registerTool(
+    config.name,
+    {
+      title: config.title,
+      description: config.description,
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        category: z.enum(CONVERSION_ACTION_CATEGORIES).optional(),
+        status: z.enum(["ENABLED", "REMOVED", "HIDDEN"]).optional(),
+        include_in_conversions_metric: z.boolean().optional(),
+        counting_type: z.enum(["ONE_PER_CLICK", "MANY_PER_CLICK"]).optional(),
+        primary_for_goal: z.boolean().optional(),
+        default_value: z.number().finite().optional(),
+        currency_code: z.string().length(3).optional(),
+        always_use_default_value: z.boolean().optional(),
+        click_through_lookback_window_days: z.number().int().positive().optional(),
+        view_through_lookback_window_days: z.number().int().positive().optional(),
+        fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = config.name;
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const conversionAction = buildConversionActionResource({
+          ...params,
+          type: config.type,
+          category: params.category ?? config.defaultCategory,
+        });
+        const result = await customer.conversionActions.create(
+          [conversionAction] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: {
+            conversion_action: conversionAction,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildConversionActionResource(
+  params: ConversionActionSetupInput
+) {
+  return {
+    name: params.name,
+    type: enumValue(enums.ConversionActionType, params.type),
+    category: enumValue(
+      enums.ConversionActionCategory,
+      params.category ?? "DEFAULT"
+    ),
+    status: enumValue(enums.ConversionActionStatus, params.status ?? "ENABLED"),
+    include_in_conversions_metric:
+      params.include_in_conversions_metric ?? true,
+    counting_type: enumValue(
+      enums.ConversionActionCountingType,
+      params.counting_type ?? "ONE_PER_CLICK"
+    ),
+    primary_for_goal: params.primary_for_goal ?? true,
+    ...(params.default_value != null || params.currency_code
+      ? {
+          value_settings: {
+            default_value: params.default_value ?? 0,
+            default_currency_code: params.currency_code ?? "USD",
+            always_use_default_value:
+              params.always_use_default_value ?? false,
+          },
+        }
+      : {}),
+    ...(params.click_through_lookback_window_days != null
+      ? {
+          click_through_lookback_window_days:
+            params.click_through_lookback_window_days,
+        }
+      : {}),
+    ...(params.view_through_lookback_window_days != null
+      ? {
+          view_through_lookback_window_days:
+            params.view_through_lookback_window_days,
+        }
+      : {}),
+    ...(params.fields ?? {}),
+  };
+}
+
 function registerConversionActionAdminTools(server: McpServer) {
   registerCollectionMutateTool({
     server,
@@ -555,6 +745,7 @@ function registerGoalTools(server: McpServer) {
     action: "update",
     resourceLabel: "Customer conversion goal",
   });
+  registerSetCustomerConversionGoalBiddable(server);
   registerGoalQueryTool(
     server,
     "list_campaign_conversion_goals",
@@ -576,6 +767,7 @@ function registerGoalTools(server: McpServer) {
     action: "update",
     resourceLabel: "Campaign conversion goal",
   });
+  registerSetCampaignConversionGoalBiddable(server);
   registerCollectionMutateTool({
     server,
     name: "create_custom_conversion_goal",
@@ -594,6 +786,128 @@ function registerGoalTools(server: McpServer) {
     action: "update",
     resourceLabel: "Conversion goal campaign config",
   });
+}
+
+function registerSetCustomerConversionGoalBiddable(server: McpServer) {
+  server.registerTool(
+    "set_customer_conversion_goal_biddable",
+    {
+      title: "Set Customer Conversion Goal Biddable",
+      description:
+        "Enable or disable bidding for a customer conversion goal by category and origin.",
+      inputSchema: {
+        customer_id: z.string(),
+        category: z.enum(CONVERSION_ACTION_CATEGORIES),
+        origin: z.enum(CONVERSION_GOAL_ORIGINS).default("WEBSITE"),
+        biddable: z.boolean(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "set_customer_conversion_goal_biddable";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resourceName = buildCustomerConversionGoalResourceName(
+          params.customer_id,
+          params.category,
+          params.origin
+        );
+        const result = await customer.customerConversionGoals.update(
+          [{ resource_name: resourceName, biddable: params.biddable }] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+function registerSetCampaignConversionGoalBiddable(server: McpServer) {
+  server.registerTool(
+    "set_campaign_conversion_goal_biddable",
+    {
+      title: "Set Campaign Conversion Goal Biddable",
+      description:
+        "Enable or disable bidding for a campaign conversion goal by campaign, category, and origin.",
+      inputSchema: {
+        customer_id: z.string(),
+        campaign_id: z.string().describe("Campaign resource name or numeric ID."),
+        category: z.enum(CONVERSION_ACTION_CATEGORIES),
+        origin: z.enum(CONVERSION_GOAL_ORIGINS).default("WEBSITE"),
+        biddable: z.boolean(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "set_campaign_conversion_goal_biddable";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const options = mutateOptions(params);
+        const resourceName = buildCampaignConversionGoalResourceName(
+          params.customer_id,
+          params.campaign_id,
+          params.category,
+          params.origin
+        );
+        const result = await customer.campaignConversionGoals.update(
+          [{ resource_name: resourceName, biddable: params.biddable }] as never[],
+          options
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: options.validate_only,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildCustomerConversionGoalResourceName(
+  customerId: string,
+  category: (typeof CONVERSION_ACTION_CATEGORIES)[number],
+  origin: (typeof CONVERSION_GOAL_ORIGINS)[number]
+) {
+  return ResourceNames.customerConversionGoal(
+    customerId,
+    enumValue(enums.ConversionActionCategory, category),
+    enumValue(enums.ConversionOrigin, origin)
+  );
+}
+
+export function buildCampaignConversionGoalResourceName(
+  customerId: string,
+  campaignId: string,
+  category: (typeof CONVERSION_ACTION_CATEGORIES)[number],
+  origin: (typeof CONVERSION_GOAL_ORIGINS)[number]
+) {
+  return ResourceNames.campaignConversionGoal(
+    customerId,
+    resourceId(campaignId, "campaigns"),
+    enumValue(enums.ConversionActionCategory, category),
+    enumValue(enums.ConversionOrigin, origin)
+  );
 }
 
 function registerConversionValueTools(server: McpServer) {
@@ -1750,6 +2064,12 @@ function parseCustomerId(resourceName: string | null) {
 function parseConversionActionId(value: string) {
   const match = CONVERSION_ACTION_RE.exec(value.trim());
   return match?.[2] ?? null;
+}
+
+function resourceId(idOrName: string, collection: string) {
+  const trimmed = idOrName.trim();
+  const match = new RegExp(`/${collection}/(\\d+)$`).exec(trimmed);
+  return match?.[1] ?? trimmed;
 }
 
 function parseGoogleDateTime(value: string) {
