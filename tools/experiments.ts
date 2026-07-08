@@ -2,7 +2,11 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { enums, services } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
-import { extractRequestId, extractResourceNames } from "@/lib/google-ads-utils";
+import {
+  extractRequestId,
+  extractResourceNames,
+  toResourceName,
+} from "@/lib/google-ads-utils";
 import { mcpJsonError, mcpSuccess, mcpText, mcpError } from "@/lib/mcp-helpers";
 import { jsonRecordSchema, mutateOptionSchema, registerCollectionMutateTool } from "@/tools/tool-utils";
 
@@ -143,13 +147,20 @@ function registerExperimentRpcTool(
       description,
       inputSchema: {
         customer_id: z.string(),
-        request: jsonRecordSchema.describe("Raw ExperimentService request object."),
+        experiment_id: z
+          .string()
+          .optional()
+          .describe("Experiment resource name or numeric ID for the common lifecycle call."),
+        request: jsonRecordSchema
+          .optional()
+          .describe("Raw ExperimentService request object. Overrides experiment_id when provided."),
       },
     },
     async (params) => {
       try {
         const customer = getAdsClient(params.customer_id);
-        const result = await customer.experiments[methodName](params.request as never);
+        const request = buildExperimentLifecycleRequest(params, methodName);
+        const result = await customer.experiments[methodName](request as never);
         return mcpSuccess({
           tool: toolName,
           customer_id: params.customer_id,
@@ -162,6 +173,31 @@ function registerExperimentRpcTool(
       }
     }
   );
+}
+
+export function buildExperimentLifecycleRequest(
+  params: {
+    customer_id: string;
+    experiment_id?: string;
+    request?: Record<string, unknown>;
+  },
+  _methodName:
+    | "scheduleExperiment"
+    | "endExperiment"
+    | "promoteExperiment"
+    | "listExperimentAsyncErrors"
+) {
+  if (params.request) return params.request;
+  if (!params.experiment_id) {
+    throw new Error("Provide experiment_id or raw request.");
+  }
+  return {
+    resource_name: toResourceName(
+      params.customer_id,
+      "experiments",
+      params.experiment_id
+    ),
+  };
 }
 
 // ── create_ad_variation ──────────────────────────────────────────────

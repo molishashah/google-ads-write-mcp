@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { enums } from "google-ads-api";
 import {
+  buildAppAdResource,
+  buildAssetGroupListingFilterResource,
+  buildAssetGroupSignalResources,
+  buildDemandGenMultiAssetAdResource,
   buildDynamicSearchAdResource,
   buildResponsiveDisplayAdResource,
+  buildShoppingProductAdResource,
 } from "./assets-ads";
 
 describe("buildResponsiveDisplayAdResource", () => {
@@ -69,6 +74,123 @@ describe("buildResponsiveDisplayAdResource", () => {
         expanded_dynamic_search_ad: {
           description: "Find the right plan for your team.",
           description2: "Compare options and get started today.",
+        },
+      },
+    });
+  });
+
+  it("builds a typed shopping product ad payload", () => {
+    expect(
+      buildShoppingProductAdResource({
+        customer_id: "123",
+        ad_group_id: "456",
+        status: "PAUSED",
+      })
+    ).toEqual({
+      ad_group: "customers/123/adGroups/456",
+      status: enums.AdGroupAdStatus.PAUSED,
+      ad: { shopping_product_ad: {} },
+    });
+  });
+
+  it("builds PMax asset group search theme and audience signals", () => {
+    expect(
+      buildAssetGroupSignalResources({
+        customer_id: "123",
+        asset_group_id: "456",
+        search_themes: ["crm automation"],
+        audience_ids: ["789"],
+      })
+    ).toEqual([
+      {
+        asset_group: "customers/123/assetGroups/456",
+        search_theme: { text: "crm automation" },
+      },
+      {
+        asset_group: "customers/123/assetGroups/456",
+        audience: { audience: "customers/123/audiences/789" },
+      },
+    ]);
+  });
+
+  it("builds PMax listing group filters with product dimensions", () => {
+    expect(
+      buildAssetGroupListingFilterResource({
+        customer_id: "123",
+        asset_group_id: "456",
+        type: "UNIT_INCLUDED",
+        parent_listing_group_filter_id: "10",
+        dimension: {
+          type: "PRODUCT_BRAND",
+          value: "Example",
+        },
+      })
+    ).toMatchObject({
+      asset_group: "customers/123/assetGroups/456",
+      type: enums.ListingGroupFilterType.UNIT_INCLUDED,
+      listing_source: enums.ListingGroupFilterListingSource.SHOPPING,
+      parent_listing_group_filter:
+        "customers/123/assetGroupListingGroupFilters/456~10",
+      case_value: {
+        product_brand: { value: "Example" },
+      },
+    });
+  });
+
+  it("builds a typed Demand Gen multi-asset ad payload", () => {
+    expect(
+      buildDemandGenMultiAssetAdResource({
+        customer_id: "123",
+        ad_group_id: "456",
+        final_urls: ["https://example.com"],
+        headlines: ["Headline"],
+        descriptions: ["Description"],
+        business_name: "Example",
+        marketing_image_asset_ids: ["111"],
+        square_marketing_image_asset_ids: ["222"],
+        call_to_action_text: "LEARN_MORE",
+      })
+    ).toMatchObject({
+      ad_group: "customers/123/adGroups/456",
+      status: enums.AdGroupAdStatus.ENABLED,
+      ad: {
+        final_urls: ["https://example.com"],
+        demand_gen_multi_asset_ad: {
+          marketing_images: [{ asset: "customers/123/assets/111" }],
+          square_marketing_images: [{ asset: "customers/123/assets/222" }],
+          headlines: [{ text: "Headline" }],
+          descriptions: [{ text: "Description" }],
+          business_name: "Example",
+          call_to_action_text: "LEARN_MORE",
+        },
+      },
+    });
+  });
+
+  it("builds a typed app ad payload", () => {
+    expect(
+      buildAppAdResource({
+        customer_id: "123",
+        ad_group_id: "456",
+        mandatory_ad_text: ["Install now"],
+        headlines: ["Track leads"],
+        descriptions: ["Close more revenue"],
+        image_asset_ids: ["111"],
+        youtube_video_asset_ids: ["222"],
+        html5_media_bundle_asset_ids: ["333"],
+        app_deep_link_asset_id: "444",
+      })
+    ).toMatchObject({
+      ad_group: "customers/123/adGroups/456",
+      ad: {
+        app_ad: {
+          mandatory_ad_text: [{ text: "Install now" }],
+          headlines: [{ text: "Track leads" }],
+          descriptions: [{ text: "Close more revenue" }],
+          images: [{ asset: "customers/123/assets/111" }],
+          youtube_videos: [{ asset: "customers/123/assets/222" }],
+          html5_media_bundles: [{ asset: "customers/123/assets/333" }],
+          app_deep_link: { asset: "customers/123/assets/444" },
         },
       },
     });

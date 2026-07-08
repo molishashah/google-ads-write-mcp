@@ -1,10 +1,14 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { enums } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
 import {
   buildGaqlQuery,
+  customerScopedConstant,
+  enumValue,
   extractRequestId,
   summarizeMetricRows,
+  type JsonRecord,
 } from "@/lib/google-ads-utils";
 import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
 import { jsonRecordSchema } from "@/tools/tool-utils";
@@ -65,13 +69,7 @@ function registerReportTools(server: McpServer) {
 }
 
 function registerKeywordPlanningTools(server: McpServer) {
-  registerRpcTool(
-    server,
-    "generate_keyword_ideas",
-    "keywordPlanIdeas",
-    "generateKeywordIdeas",
-    "Generate keyword ideas with KeywordPlanIdeaService."
-  );
+  registerGenerateKeywordIdeas(server);
   registerRpcTool(
     server,
     "generate_keyword_historical_metrics",
@@ -93,6 +91,111 @@ function registerKeywordPlanningTools(server: McpServer) {
     "generateAdGroupThemes",
     "Generate ad group themes."
   );
+}
+
+function registerGenerateKeywordIdeas(server: McpServer) {
+  server.registerTool(
+    "generate_keyword_ideas",
+    {
+      title: "Generate Keyword Ideas",
+      description:
+        "Generate keyword ideas from typed keyword/URL seeds, or pass a raw KeywordPlanIdeaService request.",
+      inputSchema: {
+        customer_id: z.string(),
+        keywords: z.array(z.string().min(1)).optional(),
+        page_url: z.string().url().optional(),
+        site_url: z.string().url().optional(),
+        language_constant_id: z.string().optional(),
+        geo_target_constant_ids: z.array(z.string()).optional(),
+        include_adult_keywords: z.boolean().optional(),
+        keyword_plan_network: z
+          .enum(["GOOGLE_SEARCH", "GOOGLE_SEARCH_AND_PARTNERS"])
+          .optional(),
+        request: jsonRecordSchema
+          .optional()
+          .describe("Raw GenerateKeywordIdeasRequest. Overrides typed fields."),
+      },
+    },
+    async (params) => {
+      const tool = "generate_keyword_ideas";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const request = buildGenerateKeywordIdeasRequest(params);
+        const result = await customer.keywordPlanIdeas.generateKeywordIdeas(
+          request as never
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+}
+
+export function buildGenerateKeywordIdeasRequest(params: {
+  customer_id: string;
+  keywords?: string[];
+  page_url?: string;
+  site_url?: string;
+  language_constant_id?: string;
+  geo_target_constant_ids?: string[];
+  include_adult_keywords?: boolean;
+  keyword_plan_network?: "GOOGLE_SEARCH" | "GOOGLE_SEARCH_AND_PARTNERS";
+  request?: JsonRecord;
+}) {
+  if (params.request) {
+    return {
+      customer_id: params.customer_id,
+      ...params.request,
+    };
+  }
+
+  const keywords = params.keywords ?? [];
+  const request: JsonRecord = {
+    customer_id: params.customer_id,
+    ...(params.language_constant_id
+      ? {
+          language: customerScopedConstant(
+            "languageConstants",
+            params.language_constant_id
+          ),
+        }
+      : {}),
+    ...(params.geo_target_constant_ids?.length
+      ? {
+          geo_target_constants: params.geo_target_constant_ids.map((id) =>
+            customerScopedConstant("geoTargetConstants", id)
+          ),
+        }
+      : {}),
+    include_adult_keywords: params.include_adult_keywords ?? false,
+    keyword_plan_network: enumValue(
+      enums.KeywordPlanNetwork,
+      params.keyword_plan_network ?? "GOOGLE_SEARCH"
+    ),
+  };
+
+  if (keywords.length && params.page_url) {
+    request.keyword_and_url_seed = {
+      keywords,
+      url: params.page_url,
+    };
+  } else if (keywords.length) {
+    request.keyword_seed = { keywords };
+  } else if (params.page_url) {
+    request.url_seed = { url: params.page_url };
+  } else if (params.site_url) {
+    request.site_seed = { site: params.site_url };
+  } else {
+    throw new Error("Provide keywords, page_url, site_url, or raw request.");
+  }
+
+  return request;
 }
 
 function registerRecommendationTools(server: McpServer) {

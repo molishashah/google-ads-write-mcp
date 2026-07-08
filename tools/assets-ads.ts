@@ -1,5 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { enums } from "google-ads-api";
+import { enums, ResourceNames } from "google-ads-api";
 import { z } from "zod";
 import { getAdsClient } from "@/lib/ads-client";
 import {
@@ -66,6 +66,86 @@ export type DynamicSearchAdInput = {
   url_custom_parameters?: Array<{ key: string; value: string }>;
   ad_fields?: JsonRecord;
   expanded_dynamic_search_ad_fields?: JsonRecord;
+};
+
+export type ShoppingProductAdInput = {
+  customer_id: string;
+  ad_group_id: string;
+  status?: "ENABLED" | "PAUSED";
+  ad_fields?: JsonRecord;
+};
+
+export type DemandGenMultiAssetAdInput = {
+  customer_id: string;
+  ad_group_id: string;
+  final_urls: string[];
+  status?: "ENABLED" | "PAUSED";
+  headlines: string[];
+  descriptions: string[];
+  business_name: string;
+  marketing_image_asset_ids: string[];
+  square_marketing_image_asset_ids?: string[];
+  portrait_marketing_image_asset_ids?: string[];
+  tall_portrait_marketing_image_asset_ids?: string[];
+  logo_image_asset_ids?: string[];
+  classic_display_image_asset_ids?: string[];
+  call_to_action_text?: string;
+  tracking_url_template?: string;
+  final_url_suffix?: string;
+  url_custom_parameters?: Array<{ key: string; value: string }>;
+  ad_fields?: JsonRecord;
+  demand_gen_multi_asset_ad_fields?: JsonRecord;
+};
+
+export type AppAdInput = {
+  customer_id: string;
+  ad_group_id: string;
+  status?: "ENABLED" | "PAUSED";
+  final_urls?: string[];
+  mandatory_ad_text?: string[];
+  headlines?: string[];
+  descriptions?: string[];
+  image_asset_ids?: string[];
+  youtube_video_asset_ids?: string[];
+  html5_media_bundle_asset_ids?: string[];
+  app_deep_link_asset_id?: string;
+  ad_fields?: JsonRecord;
+  app_ad_fields?: JsonRecord;
+};
+
+export type AssetGroupSignalInput = {
+  customer_id: string;
+  asset_group_id: string;
+  search_themes?: string[];
+  audience_ids?: string[];
+};
+
+export type AssetGroupListingFilterInput = {
+  customer_id: string;
+  asset_group_id: string;
+  type: "SUBDIVISION" | "UNIT_INCLUDED" | "UNIT_EXCLUDED";
+  listing_source?: "SHOPPING" | "WEBPAGE" | "RETAIL";
+  parent_listing_group_filter_id?: string;
+  dimension?: {
+    type:
+      | "PRODUCT_BRAND"
+      | "PRODUCT_CATEGORY"
+      | "PRODUCT_CHANNEL"
+      | "PRODUCT_CONDITION"
+      | "PRODUCT_CUSTOM_ATTRIBUTE"
+      | "PRODUCT_ITEM_ID"
+      | "PRODUCT_TYPE"
+      | "WEBPAGE_URL_CONTAINS"
+      | "WEBPAGE_CUSTOM_LABEL";
+    value?: string;
+    category_id?: number;
+    level?: "LEVEL1" | "LEVEL2" | "LEVEL3" | "LEVEL4" | "LEVEL5";
+    channel?: "ONLINE" | "LOCAL";
+    condition?: "NEW" | "REFURBISHED" | "USED";
+    index?: "INDEX0" | "INDEX1" | "INDEX2" | "INDEX3" | "INDEX4";
+  };
+  raw_case_value?: JsonRecord;
+  fields?: JsonRecord;
 };
 
 function registerAssetTools(server: McpServer) {
@@ -195,6 +275,9 @@ function registerAssetTools(server: McpServer) {
     action: "create",
     resourceLabel: "Asset group",
   });
+
+  registerPmaxAssetGroupSignalTools(server);
+  registerPmaxListingGroupFilterTools(server);
 }
 
 function registerAdFormatTools(server: McpServer) {
@@ -205,24 +288,10 @@ function registerAdFormatTools(server: McpServer) {
       "Create an AdGroupAd using a raw Google Ads ad payload. Use for ad subtypes not covered by a specialized tool.",
   });
   registerCreateResponsiveDisplayAd(server);
-  registerRawAdTool(server, {
-    name: "create_demand_gen_ad",
-    title: "Create Demand Gen Ad",
-    description:
-      "Create a Demand Gen ad. Pass one of the Demand Gen ad payloads under ad.",
-  });
-  registerRawAdTool(server, {
-    name: "create_shopping_product_ad",
-    title: "Create Shopping Product Ad",
-    description:
-      "Create a Shopping/Product ad. Pass the shopping ad payload under ad.",
-  });
+  registerCreateDemandGenAd(server);
+  registerCreateShoppingProductAd(server);
   registerCreateDynamicSearchAd(server);
-  registerRawAdTool(server, {
-    name: "create_app_ad",
-    title: "Create App Ad",
-    description: "Create an App ad. Pass app_ad or app_engagement_ad payload under ad.",
-  });
+  registerCreateAppAd(server);
 
   server.registerTool(
     "remove_automatically_created_assets",
@@ -514,6 +583,590 @@ function toAssetRefs(customerId: string, assetIds: string[]) {
   }));
 }
 
+function registerCreateShoppingProductAd(server: McpServer) {
+  server.registerTool(
+    "create_shopping_product_ad",
+    {
+      title: "Create Shopping Product Ad",
+      description:
+        "Create a Shopping product ad in a Shopping ad group. Listing/product targeting is controlled by product groups.",
+      inputSchema: {
+        customer_id: z.string(),
+        ad_group_id: z.string().describe("Ad group resource name or numeric ID."),
+        status: z.enum(["ENABLED", "PAUSED"]).optional(),
+        ad_fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_shopping_product_ad";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.adGroupAds.create(
+          [buildShoppingProductAdResource(params)],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildShoppingProductAdResource(
+  params: ShoppingProductAdInput
+): JsonRecord {
+  return {
+    ad_group: toResourceName(params.customer_id, "adGroups", params.ad_group_id),
+    status: enumValue(enums.AdGroupAdStatus, params.status ?? "ENABLED"),
+    ad: {
+      shopping_product_ad: {},
+      ...(params.ad_fields ?? {}),
+    },
+  };
+}
+
+function registerCreateDemandGenAd(server: McpServer) {
+  server.registerTool(
+    "create_demand_gen_ad",
+    {
+      title: "Create Demand Gen Multi Asset Ad",
+      description:
+        "Create a typed Demand Gen multi-asset ad from copy and asset IDs.",
+      inputSchema: {
+        customer_id: z.string(),
+        ad_group_id: z.string().describe("Ad group resource name or numeric ID."),
+        final_urls: z.array(z.string().url()).min(1),
+        status: z.enum(["ENABLED", "PAUSED"]).optional(),
+        headlines: z.array(z.string().max(40)).min(1).max(5),
+        descriptions: z.array(z.string().max(90)).min(1).max(5),
+        business_name: z.string().max(25),
+        marketing_image_asset_ids: z.array(z.string()).min(1),
+        square_marketing_image_asset_ids: z.array(z.string()).optional(),
+        portrait_marketing_image_asset_ids: z.array(z.string()).optional(),
+        tall_portrait_marketing_image_asset_ids: z.array(z.string()).optional(),
+        logo_image_asset_ids: z.array(z.string()).optional(),
+        classic_display_image_asset_ids: z.array(z.string()).optional(),
+        call_to_action_text: z.string().optional(),
+        tracking_url_template: z.string().optional(),
+        final_url_suffix: z.string().optional(),
+        url_custom_parameters: z
+          .array(z.object({ key: z.string(), value: z.string() }))
+          .optional(),
+        ad_fields: jsonRecordSchema.optional(),
+        demand_gen_multi_asset_ad_fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_demand_gen_ad";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.adGroupAds.create(
+          [buildDemandGenMultiAssetAdResource(params)],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildDemandGenMultiAssetAdResource(
+  params: DemandGenMultiAssetAdInput
+): JsonRecord {
+  return {
+    ad_group: toResourceName(params.customer_id, "adGroups", params.ad_group_id),
+    status: enumValue(enums.AdGroupAdStatus, params.status ?? "ENABLED"),
+    ad: {
+      final_urls: params.final_urls,
+      ...(params.tracking_url_template
+        ? { tracking_url_template: params.tracking_url_template }
+        : {}),
+      ...(params.final_url_suffix
+        ? { final_url_suffix: params.final_url_suffix }
+        : {}),
+      ...(params.url_custom_parameters
+        ? { url_custom_parameters: params.url_custom_parameters }
+        : {}),
+      demand_gen_multi_asset_ad: {
+        marketing_images: toAssetRefs(
+          params.customer_id,
+          params.marketing_image_asset_ids
+        ),
+        headlines: params.headlines.map((text) => ({ text })),
+        descriptions: params.descriptions.map((text) => ({ text })),
+        business_name: params.business_name,
+        ...(params.square_marketing_image_asset_ids?.length
+          ? {
+              square_marketing_images: toAssetRefs(
+                params.customer_id,
+                params.square_marketing_image_asset_ids
+              ),
+            }
+          : {}),
+        ...(params.portrait_marketing_image_asset_ids?.length
+          ? {
+              portrait_marketing_images: toAssetRefs(
+                params.customer_id,
+                params.portrait_marketing_image_asset_ids
+              ),
+            }
+          : {}),
+        ...(params.tall_portrait_marketing_image_asset_ids?.length
+          ? {
+              tall_portrait_marketing_images: toAssetRefs(
+                params.customer_id,
+                params.tall_portrait_marketing_image_asset_ids
+              ),
+            }
+          : {}),
+        ...(params.logo_image_asset_ids?.length
+          ? {
+              logo_images: toAssetRefs(
+                params.customer_id,
+                params.logo_image_asset_ids
+              ),
+            }
+          : {}),
+        ...(params.classic_display_image_asset_ids?.length
+          ? {
+              classic_display_images: toAssetRefs(
+                params.customer_id,
+                params.classic_display_image_asset_ids
+              ),
+            }
+          : {}),
+        ...(params.call_to_action_text
+          ? { call_to_action_text: params.call_to_action_text }
+          : {}),
+        ...(params.demand_gen_multi_asset_ad_fields ?? {}),
+      },
+      ...(params.ad_fields ?? {}),
+    },
+  };
+}
+
+function registerCreateAppAd(server: McpServer) {
+  server.registerTool(
+    "create_app_ad",
+    {
+      title: "Create App Ad",
+      description: "Create a typed App ad from text and asset IDs.",
+      inputSchema: {
+        customer_id: z.string(),
+        ad_group_id: z.string().describe("Ad group resource name or numeric ID."),
+        status: z.enum(["ENABLED", "PAUSED"]).optional(),
+        final_urls: z.array(z.string().url()).optional(),
+        mandatory_ad_text: z.array(z.string().max(90)).optional(),
+        headlines: z.array(z.string().max(30)).optional(),
+        descriptions: z.array(z.string().max(90)).optional(),
+        image_asset_ids: z.array(z.string()).optional(),
+        youtube_video_asset_ids: z.array(z.string()).optional(),
+        html5_media_bundle_asset_ids: z.array(z.string()).optional(),
+        app_deep_link_asset_id: z.string().optional(),
+        ad_fields: jsonRecordSchema.optional(),
+        app_ad_fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_app_ad";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.adGroupAds.create(
+          [buildAppAdResource(params)],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildAppAdResource(params: AppAdInput): JsonRecord {
+  return {
+    ad_group: toResourceName(params.customer_id, "adGroups", params.ad_group_id),
+    status: enumValue(enums.AdGroupAdStatus, params.status ?? "ENABLED"),
+    ad: {
+      ...(params.final_urls ? { final_urls: params.final_urls } : {}),
+      app_ad: {
+        ...(params.mandatory_ad_text?.length
+          ? {
+              mandatory_ad_text: params.mandatory_ad_text.map((text) => ({
+                text,
+              })),
+            }
+          : {}),
+        ...(params.headlines?.length
+          ? { headlines: params.headlines.map((text) => ({ text })) }
+          : {}),
+        ...(params.descriptions?.length
+          ? { descriptions: params.descriptions.map((text) => ({ text })) }
+          : {}),
+        ...(params.image_asset_ids?.length
+          ? { images: toAssetRefs(params.customer_id, params.image_asset_ids) }
+          : {}),
+        ...(params.youtube_video_asset_ids?.length
+          ? {
+              youtube_videos: toAssetRefs(
+                params.customer_id,
+                params.youtube_video_asset_ids
+              ),
+            }
+          : {}),
+        ...(params.html5_media_bundle_asset_ids?.length
+          ? {
+              html5_media_bundles: toAssetRefs(
+                params.customer_id,
+                params.html5_media_bundle_asset_ids
+              ),
+            }
+          : {}),
+        ...(params.app_deep_link_asset_id
+          ? {
+              app_deep_link: {
+                asset: toResourceName(
+                  params.customer_id,
+                  "assets",
+                  params.app_deep_link_asset_id
+                ),
+              },
+            }
+          : {}),
+        ...(params.app_ad_fields ?? {}),
+      },
+      ...(params.ad_fields ?? {}),
+    },
+  };
+}
+
+function registerPmaxAssetGroupSignalTools(server: McpServer) {
+  server.registerTool(
+    "create_pmax_asset_group_signals",
+    {
+      title: "Create PMax Asset Group Signals",
+      description:
+        "Create Performance Max asset group search-theme and audience signals.",
+      inputSchema: {
+        customer_id: z.string(),
+        asset_group_id: z.string().describe("Asset group resource name or numeric ID."),
+        search_themes: z.array(z.string().min(1)).optional(),
+        audience_ids: z
+          .array(z.string())
+          .optional()
+          .describe("Audience resource names or numeric IDs."),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_pmax_asset_group_signals";
+      try {
+        const resources = buildAssetGroupSignalResources(params);
+        if (!resources.length) {
+          throw new Error("Provide at least one search theme or audience ID.");
+        }
+        const customer = getAdsClient(params.customer_id);
+        const result = await customer.assetGroupSignals.create(
+          resources as never[],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: {
+            resources,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+
+  registerCollectionMutateTool({
+    server,
+    name: "remove_pmax_asset_group_signals",
+    title: "Remove PMax Asset Group Signals",
+    description: "Remove Performance Max asset group signals by resource name.",
+    collection: "assetGroupSignals",
+    action: "remove",
+    resourceLabel: "Asset group signal",
+  });
+}
+
+export function buildAssetGroupSignalResources(
+  params: AssetGroupSignalInput
+): JsonRecord[] {
+  const assetGroup = toResourceName(
+    params.customer_id,
+    "assetGroups",
+    params.asset_group_id
+  );
+  return [
+    ...(params.search_themes ?? []).map((text) => ({
+      asset_group: assetGroup,
+      search_theme: { text },
+    })),
+    ...(params.audience_ids ?? []).map((audienceId) => ({
+      asset_group: assetGroup,
+      audience: {
+        audience: toResourceName(params.customer_id, "audiences", audienceId),
+      },
+    })),
+  ];
+}
+
+function registerPmaxListingGroupFilterTools(server: McpServer) {
+  server.registerTool(
+    "create_pmax_listing_group_filter",
+    {
+      title: "Create PMax Listing Group Filter",
+      description:
+        "Create a Performance Max asset group listing group filter for Shopping/Webpage/Retail product partitions.",
+      inputSchema: {
+        customer_id: z.string(),
+        asset_group_id: z.string().describe("Asset group resource name or numeric ID."),
+        type: z.enum(["SUBDIVISION", "UNIT_INCLUDED", "UNIT_EXCLUDED"]),
+        listing_source: z.enum(["SHOPPING", "WEBPAGE", "RETAIL"]).optional(),
+        parent_listing_group_filter_id: z
+          .string()
+          .optional()
+          .describe("Parent listing filter resource name or numeric ID."),
+        dimension: z
+          .object({
+            type: z.enum([
+              "PRODUCT_BRAND",
+              "PRODUCT_CATEGORY",
+              "PRODUCT_CHANNEL",
+              "PRODUCT_CONDITION",
+              "PRODUCT_CUSTOM_ATTRIBUTE",
+              "PRODUCT_ITEM_ID",
+              "PRODUCT_TYPE",
+              "WEBPAGE_URL_CONTAINS",
+              "WEBPAGE_CUSTOM_LABEL",
+            ]),
+            value: z.string().optional(),
+            category_id: z.number().int().optional(),
+            level: z.enum(["LEVEL1", "LEVEL2", "LEVEL3", "LEVEL4", "LEVEL5"]).optional(),
+            channel: z.enum(["ONLINE", "LOCAL"]).optional(),
+            condition: z.enum(["NEW", "REFURBISHED", "USED"]).optional(),
+            index: z.enum(["INDEX0", "INDEX1", "INDEX2", "INDEX3", "INDEX4"]).optional(),
+          })
+          .optional(),
+        raw_case_value: jsonRecordSchema.optional(),
+        fields: jsonRecordSchema.optional(),
+        validate_only: z.boolean().optional(),
+      },
+    },
+    async (params) => {
+      const tool = "create_pmax_listing_group_filter";
+      try {
+        const customer = getAdsClient(params.customer_id);
+        const resource = buildAssetGroupListingFilterResource(params);
+        const result = await customer.assetGroupListingGroupFilters.create(
+          [resource] as never[],
+          { validate_only: params.validate_only ?? false }
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: {
+            resource,
+            response: result,
+          },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+
+  registerCollectionMutateTool({
+    server,
+    name: "remove_pmax_listing_group_filter",
+    title: "Remove PMax Listing Group Filter",
+    description: "Remove Performance Max listing group filters by resource name.",
+    collection: "assetGroupListingGroupFilters",
+    action: "remove",
+    resourceLabel: "Asset group listing group filter",
+  });
+}
+
+export function buildAssetGroupListingFilterResource(
+  params: AssetGroupListingFilterInput
+): JsonRecord {
+  const assetGroup = toResourceName(
+    params.customer_id,
+    "assetGroups",
+    params.asset_group_id
+  );
+  const caseValue = params.raw_case_value ?? buildListingFilterCaseValue(params);
+  return {
+    asset_group: assetGroup,
+    type: enumValue(enums.ListingGroupFilterType, params.type),
+    listing_source: enumValue(
+      enums.ListingGroupFilterListingSource,
+      params.listing_source ?? "SHOPPING"
+    ),
+    ...(caseValue ? { case_value: caseValue } : {}),
+    ...(params.parent_listing_group_filter_id
+      ? {
+          parent_listing_group_filter: toAssetGroupListingFilterResourceName(
+            params.customer_id,
+            params.asset_group_id,
+            params.parent_listing_group_filter_id
+          ),
+        }
+      : {}),
+    ...(params.fields ?? {}),
+  };
+}
+
+function buildListingFilterCaseValue(params: AssetGroupListingFilterInput) {
+  const dimension = params.dimension;
+  if (!dimension) return undefined;
+  switch (dimension.type) {
+    case "PRODUCT_BRAND":
+      return { product_brand: { value: requireDimensionValue(dimension) } };
+    case "PRODUCT_CATEGORY":
+      if (dimension.category_id == null) {
+        throw new Error("dimension.category_id is required for PRODUCT_CATEGORY.");
+      }
+      return {
+        product_category: {
+          category_id: dimension.category_id,
+          level: enumValue(
+            enums.ListingGroupFilterProductCategoryLevel,
+            dimension.level ?? "LEVEL1"
+          ),
+        },
+      };
+    case "PRODUCT_CHANNEL":
+      return {
+        product_channel: {
+          channel: enumValue(
+            enums.ListingGroupFilterProductChannel,
+            dimension.channel ?? "ONLINE"
+          ),
+        },
+      };
+    case "PRODUCT_CONDITION":
+      return {
+        product_condition: {
+          condition: enumValue(
+            enums.ListingGroupFilterProductCondition,
+            dimension.condition ?? "NEW"
+          ),
+        },
+      };
+    case "PRODUCT_CUSTOM_ATTRIBUTE":
+      return {
+        product_custom_attribute: {
+          value: requireDimensionValue(dimension),
+          index: enumValue(
+            enums.ListingGroupFilterCustomAttributeIndex,
+            dimension.index ?? "INDEX0"
+          ),
+        },
+      };
+    case "PRODUCT_ITEM_ID":
+      return { product_item_id: { value: requireDimensionValue(dimension) } };
+    case "PRODUCT_TYPE":
+      return {
+        product_type: {
+          value: requireDimensionValue(dimension),
+          level: enumValue(
+            enums.ListingGroupFilterProductTypeLevel,
+            dimension.level ?? "LEVEL1"
+          ),
+        },
+      };
+    case "WEBPAGE_URL_CONTAINS":
+      return {
+        webpage: {
+          conditions: [{ url_contains: requireDimensionValue(dimension) }],
+        },
+      };
+    case "WEBPAGE_CUSTOM_LABEL":
+      return {
+        webpage: {
+          conditions: [{ custom_label: requireDimensionValue(dimension) }],
+        },
+      };
+  }
+}
+
+function requireDimensionValue(
+  dimension: NonNullable<AssetGroupListingFilterInput["dimension"]>
+) {
+  if (!dimension.value) {
+    throw new Error(`dimension.value is required for ${dimension.type}.`);
+  }
+  return dimension.value;
+}
+
+function toAssetGroupListingFilterResourceName(
+  customerId: string,
+  assetGroupIdOrName: string,
+  filterIdOrName: string
+) {
+  if (filterIdOrName.startsWith("customers/")) return filterIdOrName;
+  return ResourceNames.assetGroupListingGroupFilter(
+    customerId,
+    resourceId(assetGroupIdOrName, "assetGroups"),
+    filterIdOrName
+  );
+}
+
 function registerCreateDynamicSearchAd(server: McpServer) {
   server.registerTool(
     "create_dynamic_search_ad",
@@ -587,6 +1240,12 @@ export function buildDynamicSearchAdResource(
       ...(params.ad_fields ?? {}),
     },
   };
+}
+
+function resourceId(idOrName: string, collection: string) {
+  const trimmed = idOrName.trim();
+  const match = new RegExp(`/${collection}/(-?\\d+)$`).exec(trimmed);
+  return match?.[1] ?? trimmed;
 }
 
 function registerRawAdTool(
