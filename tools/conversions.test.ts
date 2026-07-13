@@ -39,7 +39,15 @@ describe("conversion setup helpers", () => {
   it("builds customer and campaign conversion goal resource names", () => {
     expect(
       buildCustomerConversionGoalResourceName("123", "PURCHASE", "WEBSITE")
-    ).toBe("customers/123/customerConversionGoals/4~2");
+    ).toBe("customers/123/customerConversionGoals/PURCHASE~WEBSITE");
+
+    expect(
+      buildCustomerConversionGoalResourceName(
+        "123",
+        "QUALIFIED_LEAD",
+        "WEBSITE"
+      )
+    ).toBe("customers/123/customerConversionGoals/QUALIFIED_LEAD~WEBSITE");
 
     expect(
       buildCampaignConversionGoalResourceName(
@@ -48,7 +56,9 @@ describe("conversion setup helpers", () => {
         "IMPORTED_LEAD",
         "WEBSITE"
       )
-    ).toBe("customers/123/campaignConversionGoals/456~12~2");
+    ).toBe(
+      "customers/123/campaignConversionGoals/456~IMPORTED_LEAD~WEBSITE"
+    );
   });
 
   it("builds a typed conversion custom variable resource", () => {

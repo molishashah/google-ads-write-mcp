@@ -826,9 +826,16 @@ function registerSetCustomerConversionGoalBiddable(server: McpServer) {
     {
       title: "Set Customer Conversion Goal Biddable",
       description:
-        "Enable or disable bidding for a customer conversion goal by category and origin.",
+        "Enable or disable bidding for a customer conversion goal by category and origin. " +
+        "The customer_id must be the Google Ads conversion customer that owns the goal " +
+        "(often a manager account), not necessarily the serving child account. Use " +
+        "get_conversion_customer to find it.",
       inputSchema: {
-        customer_id: z.string(),
+        customer_id: z
+          .string()
+          .describe(
+            "Google Ads conversion customer ID that owns the goal, no hyphens."
+          ),
         category: z.enum(CONVERSION_ACTION_CATEGORIES),
         origin: z.enum(CONVERSION_GOAL_ORIGINS).default("WEBSITE"),
         biddable: z.boolean(),
@@ -923,8 +930,8 @@ export function buildCustomerConversionGoalResourceName(
 ) {
   return ResourceNames.customerConversionGoal(
     customerId,
-    enumValue(enums.ConversionActionCategory, category),
-    enumValue(enums.ConversionOrigin, origin)
+    category,
+    origin
   );
 }
 
@@ -937,8 +944,8 @@ export function buildCampaignConversionGoalResourceName(
   return ResourceNames.campaignConversionGoal(
     customerId,
     resourceId(campaignId, "campaigns"),
-    enumValue(enums.ConversionActionCategory, category),
-    enumValue(enums.ConversionOrigin, origin)
+    category,
+    origin
   );
 }
 
