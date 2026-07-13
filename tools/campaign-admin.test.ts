@@ -1,10 +1,32 @@
 import { describe, expect, it } from "vitest";
 import { enums } from "google-ads-api";
 import {
+  buildListCampaignsQuery,
   buildPerformanceMaxCampaignBundleOperations,
   buildSearchCampaignBundleOperations,
   buildShoppingCampaignBundleOperations,
 } from "./campaign-admin";
+
+describe("buildListCampaignsQuery", () => {
+  it("omits the removed v24 campaign date fields", () => {
+    const query = buildListCampaignsQuery();
+
+    expect(query).not.toContain("campaign.start_date,");
+    expect(query).not.toContain("campaign.end_date,");
+    expect(query).toContain("WHERE campaign.status != REMOVED");
+    expect(query).toContain("LIMIT 1000");
+  });
+
+  it("supports removed campaigns and a custom limit", () => {
+    const query = buildListCampaignsQuery({
+      includeRemoved: true,
+      limit: 25,
+    });
+
+    expect(query).not.toContain("WHERE campaign.status != REMOVED");
+    expect(query).toContain("LIMIT 25");
+  });
+});
 
 describe("buildSearchCampaignBundleOperations", () => {
   it("builds one atomic Search campaign bundle with temp resource names", () => {

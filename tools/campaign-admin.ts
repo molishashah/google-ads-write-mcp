@@ -144,26 +144,10 @@ function registerCampaignReadTools(server: McpServer) {
       const tool = "list_campaigns";
       try {
         const customer = getAdsClient(params.customer_id);
-        const conditions = params.include_removed
-          ? ""
-          : "WHERE campaign.status != REMOVED";
-        const query = `
-          SELECT
-            campaign.resource_name,
-            campaign.id,
-            campaign.name,
-            campaign.status,
-            campaign.advertising_channel_type,
-            campaign.campaign_budget,
-            metrics.impressions,
-            metrics.clicks,
-            metrics.cost_micros,
-            metrics.conversions,
-            metrics.conversions_value
-          FROM campaign
-          ${conditions}
-          ORDER BY campaign.name
-          LIMIT ${params.limit ?? 1000}`;
+        const query = buildListCampaignsQuery({
+          includeRemoved: params.include_removed,
+          limit: params.limit,
+        });
         const rows = await customer.query(query);
         return mcpSuccess({
           tool,
@@ -228,6 +212,32 @@ function registerCampaignReadTools(server: McpServer) {
       }
     }
   );
+}
+
+export function buildListCampaignsQuery(params: {
+  includeRemoved?: boolean;
+  limit?: number;
+} = {}) {
+  const conditions = params.includeRemoved
+    ? ""
+    : "WHERE campaign.status != REMOVED";
+  return `
+    SELECT
+      campaign.resource_name,
+      campaign.id,
+      campaign.name,
+      campaign.status,
+      campaign.advertising_channel_type,
+      campaign.campaign_budget,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.cost_micros,
+      metrics.conversions,
+      metrics.conversions_value
+    FROM campaign
+    ${conditions}
+    ORDER BY campaign.name
+    LIMIT ${params.limit ?? 1000}`;
 }
 
 function registerCampaignMutateTools(server: McpServer) {
