@@ -18,6 +18,12 @@ import {
 } from "@/lib/google-ads-utils";
 import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
 import {
+  buildSearchCampaignBiddingStrategy,
+  TARGET_IMPRESSION_SHARE_LOCATIONS,
+  type SearchCampaignBiddingInput,
+  type TargetImpressionShareLocation,
+} from "@/tools/campaign-bidding";
+import {
   jsonRecordSchema,
   mutateOptions,
   mutateOptionSchema,
@@ -28,7 +34,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const STATUS = z.enum(["ENABLED", "PAUSED", "REMOVED"]);
 const CAMPAIGN_STATUS = z.enum(["ENABLED", "PAUSED"]);
 
-export type SearchCampaignBundleInput = {
+export type SearchCampaignBundleInput = SearchCampaignBiddingInput & {
   customer_id: string;
   name: string;
   daily_budget: number;
@@ -482,19 +488,38 @@ function registerBudgetTools(server: McpServer) {
     {
       title: "Update Campaign Bidding Strategy",
       description:
-        "Set a campaign bidding strategy. Supports common campaign-level strategy fields.",
+        "Set a campaign bidding strategy. Target Impression Share is for Search campaigns and supports anywhere, top, or absolute-top placement.",
       inputSchema: {
         customer_id: z.string(),
         campaign_id: z.string().describe("Campaign resource name or numeric ID."),
         strategy: z.enum([
           "MAXIMIZE_CLICKS",
+          "TARGET_IMPRESSION_SHARE",
           "MAXIMIZE_CONVERSIONS",
           "MAXIMIZE_CONVERSION_VALUE",
           "TARGET_CPA",
           "TARGET_ROAS",
           "MANUAL_CPC",
         ]),
-        cpc_bid_ceiling: z.number().positive().optional(),
+        cpc_bid_ceiling: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            "CPC ceiling in account currency. Required for Target Impression Share."
+          ),
+        target_impression_share_location: z
+          .enum(TARGET_IMPRESSION_SHARE_LOCATIONS)
+          .optional()
+          .describe("Required for Target Impression Share."),
+        target_impression_share_percentage: z
+          .number()
+          .positive()
+          .max(100)
+          .optional()
+          .describe(
+            "Required for Target Impression Share. Desired share as a percentage greater than 0 and at most 100."
+          ),
         target_cpa: z.number().positive().optional(),
         target_roas: z.number().positive().optional(),
         enhanced_cpc_enabled: z.boolean().optional(),
@@ -936,13 +961,35 @@ function registerSearchCampaignBundle(server: McpServer) {
       title: "Create Search Campaign Bundle",
       description:
         "Atomically create a complete Search campaign: budget, campaign, ad groups, " +
-        "RSAs, keywords, negatives, and basic targeting. Defaults to PAUSED but can create ENABLED.",
+        "RSAs, keywords, negatives, and basic targeting. Supports Maximize Clicks and " +
+        "Target Impression Share bidding. Defaults to PAUSED but can create ENABLED.",
       inputSchema: {
         customer_id: z.string(),
         name: z.string().min(1),
         daily_budget: z.number().positive(),
         initial_status: CAMPAIGN_STATUS.optional(),
-        cpc_bid_ceiling: z.number().positive().optional(),
+        bidding_strategy: z
+          .enum(["MAXIMIZE_CLICKS", "TARGET_IMPRESSION_SHARE"])
+          .optional(),
+        cpc_bid_ceiling: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            "CPC ceiling in account currency. Required for Target Impression Share."
+          ),
+        target_impression_share_location: z
+          .enum(TARGET_IMPRESSION_SHARE_LOCATIONS)
+          .optional()
+          .describe("Required for Target Impression Share."),
+        target_impression_share_percentage: z
+          .number()
+          .positive()
+          .max(100)
+          .optional()
+          .describe(
+            "Required for Target Impression Share. Desired share as a percentage greater than 0 and at most 100."
+          ),
         include_search_partners: z.boolean().optional(),
         include_display_network: z.boolean().optional(),
         start_date: z.string().regex(DATE_RE).optional(),
@@ -1041,10 +1088,7 @@ export function buildSearchCampaignBundleOperations(
         contains_eu_political_advertising:
           enums.EuPoliticalAdvertisingStatus
             .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
-        target_spend:
-          params.cpc_bid_ceiling != null
-            ? { cpc_bid_ceiling_micros: toMicros(params.cpc_bid_ceiling) }
-            : {},
+        ...buildSearchCampaignBiddingStrategy(params),
         network_settings: {
           target_google_search: true,
           target_search_network: params.include_search_partners ?? true,
@@ -1704,13 +1748,38 @@ async function resolveCampaignBudget(
   return budget;
 }
 
-function buildBiddingStrategy(params: {
+export function buildBiddingStrategy(params: {
   strategy: string;
   cpc_bid_ceiling?: number;
+  target_impression_share_location?: TargetImpressionShareLocation;
+  target_impression_share_percentage?: number;
   target_cpa?: number;
   target_roas?: number;
   enhanced_cpc_enabled?: boolean;
 }) {
+  if (params.strategy === "TARGET_IMPRESSION_SHARE") {
+    return buildSearchCampaignBiddingStrategy({
+      bidding_strategy: "TARGET_IMPRESSION_SHARE",
+      cpc_bid_ceiling: params.cpc_bid_ceiling,
+      target_impression_share_location:
+        params.target_impression_share_location,
+      target_impression_share_percentage:
+        params.target_impression_share_percentage,
+    });
+  }
+  if (
+    params.target_impression_share_location != null ||
+    params.target_impression_share_percentage != null
+  ) {
+    return buildSearchCampaignBiddingStrategy({
+      bidding_strategy: "MAXIMIZE_CLICKS",
+      cpc_bid_ceiling: params.cpc_bid_ceiling,
+      target_impression_share_location:
+        params.target_impression_share_location,
+      target_impression_share_percentage:
+        params.target_impression_share_percentage,
+    });
+  }
   if (params.strategy === "MAXIMIZE_CLICKS") {
     return {
       target_spend:
