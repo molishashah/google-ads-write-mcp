@@ -3,11 +3,13 @@ import { enums } from "google-ads-api";
 import {
   buildAppAdResource,
   buildAssetGroupListingFilterResource,
+  buildAssetGroupAssetLinks,
   buildAssetGroupSignalResources,
   buildDemandGenMultiAssetAdResource,
   buildDynamicSearchAdResource,
   buildResponsiveDisplayAdResource,
   buildShoppingProductAdResource,
+  validatePmaxCreativeCoverage,
 } from "./assets-ads";
 
 describe("buildResponsiveDisplayAdResource", () => {
@@ -111,6 +113,51 @@ describe("buildResponsiveDisplayAdResource", () => {
         audience: { audience: "customers/123/audiences/789" },
       },
     ]);
+  });
+
+  it("builds typed PMax asset group links", () => {
+    expect(
+      buildAssetGroupAssetLinks({
+        customer_id: "123",
+        asset_group_id: "456",
+        assets: [
+          { asset_id: "111", field_type: "HEADLINE" },
+          { asset_id: "222", field_type: "MARKETING_IMAGE" },
+        ],
+      })
+    ).toEqual([
+      {
+        asset_group: "customers/123/assetGroups/456",
+        asset: "customers/123/assets/111",
+        field_type: enums.AssetFieldType.HEADLINE,
+      },
+      {
+        asset_group: "customers/123/assetGroups/456",
+        asset: "customers/123/assets/222",
+        field_type: enums.AssetFieldType.MARKETING_IMAGE,
+      },
+    ]);
+  });
+
+  it("reports missing PMax creative coverage", () => {
+    expect(
+      validatePmaxCreativeCoverage({
+        assets: [{ field_type: "HEADLINE" }],
+      })
+    ).toMatchObject({
+      valid: false,
+      campaign_mode: "STANDARD",
+      missing: expect.arrayContaining([
+        { field_type: "HEADLINE", minimum: 3, actual: 1 },
+        { field_type: "LOGO", minimum: 1, actual: 0 },
+      ]),
+    });
+  });
+
+  it("allows feed-only retail asset groups", () => {
+    expect(
+      validatePmaxCreativeCoverage({ campaign_mode: "RETAIL", assets: [] })
+    ).toMatchObject({ valid: true, missing: [] });
   });
 
   it("builds PMax listing group filters with product dimensions", () => {

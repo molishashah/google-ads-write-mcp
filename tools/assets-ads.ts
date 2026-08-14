@@ -148,6 +148,31 @@ export type AssetGroupListingFilterInput = {
   fields?: JsonRecord;
 };
 
+export type AssetGroupAssetLinkInput = {
+  customer_id: string;
+  asset_group_id: string;
+  assets: Array<{
+    asset_id: string;
+    field_type:
+      | "HEADLINE"
+      | "LONG_HEADLINE"
+      | "DESCRIPTION"
+      | "BUSINESS_NAME"
+      | "MARKETING_IMAGE"
+      | "SQUARE_MARKETING_IMAGE"
+      | "PORTRAIT_MARKETING_IMAGE"
+      | "LOGO"
+      | "LANDSCAPE_LOGO"
+      | "YOUTUBE_VIDEO"
+      | "CALL_TO_ACTION_SELECTION";
+  }>;
+};
+
+export type PmaxCreativeCoverageInput = {
+  campaign_mode?: "STANDARD" | "RETAIL";
+  assets: Array<{ field_type: AssetGroupAssetLinkInput["assets"][number]["field_type"] }>;
+};
+
 function registerAssetTools(server: McpServer) {
   server.registerTool(
     "list_assets",
@@ -276,8 +301,295 @@ function registerAssetTools(server: McpServer) {
     resourceLabel: "Asset group",
   });
 
+  registerPmaxAssetGroupLifecycleTools(server);
+
   registerPmaxAssetGroupSignalTools(server);
   registerPmaxListingGroupFilterTools(server);
+}
+
+function registerPmaxAssetGroupLifecycleTools(server: McpServer) {
+  server.registerTool(
+    "list_pmax_asset_groups",
+    {
+      title: "List Performance Max Asset Groups",
+      description:
+        "List Performance Max asset groups, their campaign, URLs, status, and ad strength.",
+      inputSchema: {
+        customer_id: z.string(),
+        campaign_id: z.string().optional(),
+        include_removed: z.boolean().optional(),
+        limit: z.number().int().positive().max(10000).optional(),
+      },
+    },
+    async (params) => {
+      const tool = "list_pmax_asset_groups";
+      try {
+        const conditions = [
+          ...(params.include_removed
+            ? []
+            : ["asset_group.status != 'REMOVED'"]),
+          ...(params.campaign_id
+            ? [
+                `asset_group.campaign = '${escapeGaql(
+                  toResourceName(
+                    params.customer_id,
+                    "campaigns",
+                    params.campaign_id
+                  )
+                )}'`,
+              ]
+            : []),
+        ];
+        const where = conditions.length
+          ? `WHERE ${conditions.join(" AND ")}`
+          : "";
+        const query = `
+          SELECT
+            asset_group.resource_name,
+            asset_group.id,
+            asset_group.campaign,
+            asset_group.name,
+            asset_group.status,
+            asset_group.final_urls,
+            asset_group.final_mobile_urls,
+            asset_group.path1,
+            asset_group.path2,
+            asset_group.ad_strength
+          FROM asset_group
+          ${where}
+          ORDER BY asset_group.name
+          LIMIT ${params.limit ?? 1000}`;
+        const rows = await getAdsClient(params.customer_id).query(query);
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          results: { query, rows },
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+
+  server.registerTool(
+    "get_pmax_asset_group",
+    {
+      title: "Get Performance Max Asset Group",
+      description: "Fetch an asset group and all of its linked creative assets.",
+      inputSchema: {
+        customer_id: z.string(),
+        asset_group_id: z.string(),
+        limit: z.number().int().positive().max(1000).optional(),
+      },
+    },
+    async (params) => {
+      const tool = "get_pmax_asset_group";
+      try {
+        const resourceName = toResourceName(
+          params.customer_id,
+          "assetGroups",
+          params.asset_group_id
+        );
+        const groupQuery = `SELECT asset_group.resource_name, asset_group.id, asset_group.campaign, asset_group.name, asset_group.status, asset_group.final_urls, asset_group.final_mobile_urls, asset_group.path1, asset_group.path2, asset_group.ad_strength FROM asset_group WHERE asset_group.resource_name = '${escapeGaql(resourceName)}' LIMIT 1`;
+        const assetsQuery = `SELECT asset_group_asset.resource_name, asset_group_asset.asset_group, asset_group_asset.asset, asset_group_asset.field_type, asset_group_asset.status, asset_group_asset.performance_label, asset_group_asset.primary_status, asset_group_asset.primary_status_reasons, asset.resource_name, asset.name, asset.type FROM asset_group_asset WHERE asset_group_asset.asset_group = '${escapeGaql(resourceName)}' AND asset_group_asset.status != 'REMOVED' LIMIT ${params.limit ?? 1000}`;
+        const customer = getAdsClient(params.customer_id);
+        const [groups, assets] = await Promise.all([
+          customer.query(groupQuery),
+          customer.query(assetsQuery),
+        ]);
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          resource_names: [resourceName],
+          results: { group: groups[0] ?? null, assets, group_query: groupQuery, assets_query: assetsQuery },
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, { customer_id: params.customer_id });
+      }
+    }
+  );
+
+  registerCollectionMutateTool({
+    server,
+    name: "update_pmax_asset_group",
+    title: "Update Performance Max Asset Group",
+    description: "Update mutable asset-group fields such as name, status, and URLs.",
+    collection: "assetGroups",
+    action: "update",
+    resourceLabel: "Asset group",
+  });
+  registerCollectionMutateTool({
+    server,
+    name: "remove_pmax_asset_group",
+    title: "Remove Performance Max Asset Group",
+    description: "Remove Performance Max asset groups by resource name.",
+    collection: "assetGroups",
+    action: "remove",
+    resourceLabel: "Asset group",
+  });
+
+  server.registerTool(
+    "attach_pmax_asset_group_assets",
+    {
+      title: "Attach Performance Max Asset Group Assets",
+      description:
+        "Attach existing assets to an asset group with typed field roles.",
+      inputSchema: {
+        customer_id: z.string(),
+        asset_group_id: z.string(),
+        assets: z
+          .array(
+            z.object({
+              asset_id: z.string(),
+              field_type: z.enum([
+                "HEADLINE",
+                "LONG_HEADLINE",
+                "DESCRIPTION",
+                "BUSINESS_NAME",
+                "MARKETING_IMAGE",
+                "SQUARE_MARKETING_IMAGE",
+                "PORTRAIT_MARKETING_IMAGE",
+                "LOGO",
+                "LANDSCAPE_LOGO",
+                "YOUTUBE_VIDEO",
+                "CALL_TO_ACTION_SELECTION",
+              ]),
+            })
+          )
+          .min(1),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "attach_pmax_asset_group_assets";
+      try {
+        const resources = buildAssetGroupAssetLinks(params);
+        const result = await getAdsClient(
+          params.customer_id
+        ).assetGroupAssets.create(resources as never[], mutateOptions(params));
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: { resources, response: result },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+
+  registerCollectionMutateTool({
+    server,
+    name: "detach_pmax_asset_group_assets",
+    title: "Detach Performance Max Asset Group Assets",
+    description: "Detach assets from asset groups by AssetGroupAsset resource name.",
+    collection: "assetGroupAssets",
+    action: "remove",
+    resourceLabel: "Asset group asset link",
+  });
+
+  server.registerTool(
+    "validate_pmax_creative_coverage",
+    {
+      title: "Validate Performance Max Creative Coverage",
+      description:
+        "Preflight an intended asset mix against standard Performance Max minimum creative coverage before mutation.",
+      inputSchema: {
+        campaign_mode: z.enum(["STANDARD", "RETAIL"]).optional(),
+        assets: z
+          .array(
+            z.object({
+              field_type: z.enum([
+                "HEADLINE",
+                "LONG_HEADLINE",
+                "DESCRIPTION",
+                "BUSINESS_NAME",
+                "MARKETING_IMAGE",
+                "SQUARE_MARKETING_IMAGE",
+                "PORTRAIT_MARKETING_IMAGE",
+                "LOGO",
+                "LANDSCAPE_LOGO",
+                "YOUTUBE_VIDEO",
+                "CALL_TO_ACTION_SELECTION",
+              ]),
+            })
+          ),
+      },
+    },
+    async (params) =>
+      mcpSuccess({
+        tool: "validate_pmax_creative_coverage",
+        results: validatePmaxCreativeCoverage(params),
+      })
+  );
+}
+
+export function buildAssetGroupAssetLinks(params: AssetGroupAssetLinkInput) {
+  const assetGroup = toResourceName(
+    params.customer_id,
+    "assetGroups",
+    params.asset_group_id
+  );
+  const seen = new Set<string>();
+  return params.assets.map((entry) => {
+    const asset = toResourceName(params.customer_id, "assets", entry.asset_id);
+    const key = `${asset}:${entry.field_type}`;
+    if (seen.has(key)) {
+      throw new Error(`Duplicate asset/field role: ${key}`);
+    }
+    seen.add(key);
+    return {
+      asset_group: assetGroup,
+      asset,
+      field_type: enumValue(enums.AssetFieldType, entry.field_type),
+    };
+  });
+}
+
+export function validatePmaxCreativeCoverage(
+  params: PmaxCreativeCoverageInput
+) {
+  const counts = params.assets.reduce<Record<string, number>>((result, asset) => {
+    result[asset.field_type] = (result[asset.field_type] ?? 0) + 1;
+    return result;
+  }, {});
+  const required: Record<string, number> =
+    params.campaign_mode === "RETAIL"
+      ? {}
+      : {
+          HEADLINE: 3,
+          LONG_HEADLINE: 1,
+          DESCRIPTION: 2,
+          BUSINESS_NAME: 1,
+          MARKETING_IMAGE: 1,
+          SQUARE_MARKETING_IMAGE: 1,
+          LOGO: 1,
+        };
+  const missing = Object.entries(required).flatMap(([fieldType, minimum]) =>
+    (counts[fieldType] ?? 0) < minimum
+      ? [{ field_type: fieldType, minimum, actual: counts[fieldType] ?? 0 }]
+      : []
+  );
+  return {
+    valid: missing.length === 0,
+    campaign_mode: params.campaign_mode ?? "STANDARD",
+    counts,
+    missing,
+    recommendations: [
+      ...(counts.YOUTUBE_VIDEO
+        ? []
+        : ["Add a YouTube video asset to avoid relying on automatic video generation."]),
+      ...(counts.PORTRAIT_MARKETING_IMAGE
+        ? []
+        : ["Add a portrait image to improve coverage on vertical inventory."]),
+    ],
+  };
 }
 
 function registerAdFormatTools(server: McpServer) {
