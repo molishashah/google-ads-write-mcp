@@ -13,6 +13,7 @@ import { registerConversionTools } from "@/tools/conversions";
 import { registerReportingAndResearchTools } from "@/tools/reporting-research";
 import { registerAccountAdminTools } from "@/tools/account-admin";
 import { registerGenericAdminTools } from "@/tools/admin-generic";
+import { registerBiddingAdminTools } from "@/tools/bidding-admin";
 
 const handler = createMcpHandler(
   (server) => {
@@ -29,6 +30,7 @@ const handler = createMcpHandler(
     registerReportingAndResearchTools(server);
     registerAccountAdminTools(server);
     registerGenericAdminTools(server);
+    registerBiddingAdminTools(server);
   },
   {
     serverInfo: {
