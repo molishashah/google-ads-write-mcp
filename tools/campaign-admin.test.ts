@@ -3,6 +3,8 @@ import { enums } from "google-ads-api";
 import {
   buildListCampaignsQuery,
   buildBiddingStrategy,
+  buildAppCampaignBundleOperations,
+  buildDemandGenCampaignBundleOperations,
   buildPerformanceMaxCampaignBundleOperations,
   buildSearchCampaignBundleOperations,
   buildShoppingCampaignBundleOperations,
@@ -222,6 +224,91 @@ describe("buildSearchCampaignBundleOperations", () => {
       ad_group: "customers/123/adGroups/-3",
       status: enums.AdGroupAdStatus.ENABLED,
       ad: { shopping_product_ad: {} },
+    });
+  });
+
+  it("builds an atomic Demand Gen campaign and ad-group targeting", () => {
+    const operations = buildDemandGenCampaignBundleOperations({
+      customer_id: "123",
+      name: "Demand Gen",
+      daily_budget: 40,
+      bidding_strategy: "TARGET_CPA",
+      target_cpa: 12,
+      ad_group_name: "Prospects",
+      geo_target_constant_ids: ["2840"],
+      language_constant_ids: ["1000"],
+    });
+
+    expect(operations.map((operation) => operation.entity)).toEqual([
+      "campaign_budget",
+      "campaign",
+      "ad_group",
+      "ad_group_criterion",
+      "ad_group_criterion",
+    ]);
+    expect(operations[1].resource).toMatchObject({
+      advertising_channel_type: enums.AdvertisingChannelType.DEMAND_GEN,
+      target_cpa: { target_cpa_micros: 12_000_000 },
+    });
+    expect(operations[3].resource).toMatchObject({
+      ad_group: "customers/123/adGroups/-3",
+      location: { geo_target_constant: "geoTargetConstants/2840" },
+    });
+  });
+
+  it("builds an atomic App campaign with required settings", () => {
+    const operations = buildAppCampaignBundleOperations({
+      customer_id: "123",
+      name: "App installs",
+      daily_budget: 60,
+      app_id: "com.example.app",
+      app_store: "GOOGLE_APP_STORE",
+      bidding_goal: "OPTIMIZE_INSTALLS_TARGET_INSTALL_COST",
+      target_cpa: 8,
+      ad_group_name: "Installers",
+      geo_target_constant_ids: ["2840"],
+    });
+
+    expect(operations.map((operation) => operation.entity)).toEqual([
+      "campaign_budget",
+      "campaign",
+      "ad_group",
+      "campaign_criterion",
+    ]);
+    expect(operations[1].resource).toMatchObject({
+      advertising_channel_type: enums.AdvertisingChannelType.MULTI_CHANNEL,
+      advertising_channel_sub_type:
+        enums.AdvertisingChannelSubType.APP_CAMPAIGN,
+      app_campaign_setting: {
+        app_id: "com.example.app",
+        app_store: enums.AppCampaignAppStore.GOOGLE_APP_STORE,
+        bidding_strategy_goal_type:
+          enums.AppCampaignBiddingStrategyGoalType
+            .OPTIMIZE_INSTALLS_TARGET_INSTALL_COST,
+      },
+      target_cpa: { target_cpa_micros: 8_000_000 },
+    });
+  });
+
+  it("adds selective optimization for App engagement", () => {
+    const operations = buildAppCampaignBundleOperations({
+      customer_id: "123",
+      name: "App engagement",
+      daily_budget: 60,
+      app_id: "com.example.app",
+      app_store: "GOOGLE_APP_STORE",
+      app_campaign_subtype: "APP_CAMPAIGN_FOR_ENGAGEMENT",
+      bidding_goal: "OPTIMIZE_IN_APP_CONVERSIONS_TARGET_CONVERSION_COST",
+      target_cpa: 10,
+      conversion_action_ids: ["999"],
+      ad_group_name: "Returners",
+    });
+
+    expect(operations[1].resource).toMatchObject({
+      selective_optimization: {
+        conversion_actions: ["customers/123/conversionActions/999"],
+      },
+      target_cpa: { target_cpa_micros: 10_000_000 },
     });
   });
 });

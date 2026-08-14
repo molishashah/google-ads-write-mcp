@@ -1195,99 +1195,440 @@ export function buildSearchCampaignBundleOperations(
 function registerChannelCampaignBundleTools(server: McpServer) {
   registerPerformanceMaxCampaignBundle(server);
   registerShoppingCampaignBundle(server);
+  registerDemandGenCampaignBundle(server);
+  registerAppCampaignBundle(server);
+}
 
-  const tools = [
+type DemandGenCampaignBundleInput = {
+  customer_id: string;
+  name: string;
+  daily_budget: number;
+  initial_status?: "PAUSED" | "ENABLED";
+  bidding_strategy?:
+    | "MAXIMIZE_CLICKS"
+    | "TARGET_CPA"
+    | "MAXIMIZE_CONVERSIONS"
+    | "TARGET_ROAS";
+  cpc_bid_ceiling?: number;
+  target_cpa?: number;
+  target_roas?: number;
+  ad_group_name: string;
+  geo_target_constant_ids?: string[];
+  language_constant_ids?: string[];
+  campaign_fields?: JsonRecord;
+  ad_group_fields?: JsonRecord;
+};
+
+function registerDemandGenCampaignBundle(server: McpServer) {
+  server.registerTool(
+    "create_demand_gen_campaign_bundle",
     {
-      name: "create_demand_gen_campaign_bundle",
       title: "Create Demand Gen Campaign Bundle",
-      channel: "DEMAND_GEN",
+      description:
+        "Atomically create a non-shared budget, Demand Gen campaign, ad group, and ad-group location/language criteria. Add creative with create_demand_gen_ad.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        daily_budget: z.number().positive(),
+        initial_status: CAMPAIGN_STATUS.optional(),
+        bidding_strategy: z
+          .enum([
+            "MAXIMIZE_CLICKS",
+            "TARGET_CPA",
+            "MAXIMIZE_CONVERSIONS",
+            "TARGET_ROAS",
+          ])
+          .optional(),
+        cpc_bid_ceiling: z.number().positive().optional(),
+        target_cpa: z.number().positive().optional(),
+        target_roas: z.number().positive().optional(),
+        ad_group_name: z.string().min(1),
+        geo_target_constant_ids: z.array(z.string()).optional(),
+        language_constant_ids: z.array(z.string()).optional(),
+        campaign_fields: jsonRecordSchema.optional(),
+        ad_group_fields: jsonRecordSchema.optional(),
+        validate_only: z.boolean().optional(),
+      },
+    },
+    async (params) =>
+      runChannelBundle(
+        "create_demand_gen_campaign_bundle",
+        params,
+        buildDemandGenCampaignBundleOperations(params)
+      )
+  );
+}
+
+export function buildDemandGenCampaignBundleOperations(
+  params: DemandGenCampaignBundleInput
+): MutateOperation<unknown>[] {
+  if (
+    params.bidding_strategy !== "TARGET_ROAS" &&
+    params.target_roas != null
+  ) {
+    throw new Error("target_roas requires TARGET_ROAS");
+  }
+  if (
+    params.bidding_strategy !== "TARGET_CPA" &&
+    params.target_cpa != null
+  ) {
+    throw new Error("target_cpa requires TARGET_CPA");
+  }
+  const customerId = params.customer_id;
+  const budget = ResourceNames.campaignBudget(customerId, "-1");
+  const campaign = ResourceNames.campaign(customerId, "-2");
+  const adGroup = ResourceNames.adGroup(customerId, "-3");
+  const strategy = params.bidding_strategy ?? "MAXIMIZE_CONVERSIONS";
+  if (strategy === "TARGET_CPA" && params.target_cpa == null) {
+    throw new Error("target_cpa is required for TARGET_CPA");
+  }
+  if (strategy === "TARGET_ROAS" && params.target_roas == null) {
+    throw new Error("target_roas is required for TARGET_ROAS");
+  }
+  if (strategy !== "MAXIMIZE_CLICKS" && params.cpc_bid_ceiling != null) {
+    throw new Error("cpc_bid_ceiling requires MAXIMIZE_CLICKS");
+  }
+  const operations: MutateOperation<unknown>[] = [
+    {
+      entity: "campaign_budget",
+      operation: "create",
+      resource: {
+        resource_name: budget,
+        name: `${params.name} budget`,
+        amount_micros: toMicros(params.daily_budget),
+        delivery_method: enums.BudgetDeliveryMethod.STANDARD,
+        explicitly_shared: false,
+      },
     },
     {
-      name: "create_app_campaign_bundle",
-      title: "Create App Campaign Bundle",
-      channel: "MULTI_CHANNEL",
+      entity: "campaign",
+      operation: "create",
+      resource: {
+        resource_name: campaign,
+        name: params.name,
+        status: enumValue(enums.CampaignStatus, params.initial_status ?? "PAUSED"),
+        advertising_channel_type: enums.AdvertisingChannelType.DEMAND_GEN,
+        campaign_budget: budget,
+        contains_eu_political_advertising:
+          enums.EuPoliticalAdvertisingStatus
+            .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
+        ...(strategy === "MAXIMIZE_CLICKS"
+          ? {
+              target_spend:
+                params.cpc_bid_ceiling != null
+                  ? { cpc_bid_ceiling_micros: toMicros(params.cpc_bid_ceiling) }
+                  : {},
+            }
+          : strategy === "TARGET_CPA"
+            ? { target_cpa: { target_cpa_micros: toMicros(params.target_cpa!) } }
+            : strategy === "TARGET_ROAS"
+              ? { target_roas: { target_roas: params.target_roas! } }
+              : { maximize_conversions: {} }),
+        ...(params.campaign_fields ?? {}),
+      },
     },
-  ] as const;
-
-  for (const item of tools) {
-    server.registerTool(
-      item.name,
-      {
-        title: item.title,
-        description:
-          "Create the budget and campaign shell for this channel. Pass channel-specific " +
-          "settings in campaign_fields, then use asset/ad/targeting tools to complete setup.",
-        inputSchema: {
-          customer_id: z.string(),
-          name: z.string().min(1),
-          daily_budget: z.number().positive(),
-          initial_status: CAMPAIGN_STATUS.optional(),
-          campaign_fields: jsonRecordSchema.optional(),
-          validate_only: z.boolean().optional(),
+    {
+      entity: "ad_group",
+      operation: "create",
+      resource: {
+        resource_name: adGroup,
+        campaign,
+        name: params.ad_group_name,
+        status: enums.AdGroupStatus.ENABLED,
+        ...(params.ad_group_fields ?? {}),
+      },
+    },
+  ];
+  for (const id of params.geo_target_constant_ids ?? []) {
+    operations.push({
+      entity: "ad_group_criterion",
+      operation: "create",
+      resource: {
+        ad_group: adGroup,
+        location: {
+          geo_target_constant: customerScopedConstant("geoTargetConstants", id),
         },
       },
-      async (params) => {
-        const tool = item.name;
-        try {
-          const customer = getAdsClient(params.customer_id);
-          const cid = params.customer_id;
-          const budgetTmp = ResourceNames.campaignBudget(cid, "-1");
-          const operations: MutateOperation<unknown>[] = [
-            {
-              entity: "campaign_budget",
-              operation: "create",
-              resource: {
-                resource_name: budgetTmp,
-                name: `${params.name} budget (${Date.now()})`,
-                amount_micros: toMicros(params.daily_budget),
-                delivery_method: enums.BudgetDeliveryMethod.STANDARD,
-                explicitly_shared: false,
-              },
-            },
-            {
-              entity: "campaign",
-              operation: "create",
-              resource: {
-                name: params.name,
-                status: enumValue(
-                  enums.CampaignStatus,
-                  params.initial_status ?? "PAUSED"
-                ),
-                advertising_channel_type: enumValue(
-                  enums.AdvertisingChannelType,
-                  item.channel
-                ),
-                campaign_budget: budgetTmp,
-                contains_eu_political_advertising:
-                  enums.EuPoliticalAdvertisingStatus
-                    .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
-                ...(params.campaign_fields ?? {}),
-              },
-            },
-          ];
-          const result = await customer.mutateResources(operations, {
-            validate_only: params.validate_only ?? false,
-          });
-          return mcpSuccess({
-            tool,
-            customer_id: params.customer_id,
-            validate_only: params.validate_only ?? false,
-            resource_names: extractResourceNames(result),
-            results: {
-              channel: item.channel,
-              operation_count: operations.length,
-              response: result,
-            },
-            request_id: extractRequestId(result),
-          });
-        } catch (err) {
-          return mcpJsonError(tool, err, {
-            customer_id: params.customer_id,
-            validate_only: params.validate_only,
-          });
-        }
-      }
+    });
+  }
+  for (const id of params.language_constant_ids ?? []) {
+    operations.push({
+      entity: "ad_group_criterion",
+      operation: "create",
+      resource: {
+        ad_group: adGroup,
+        language: {
+          language_constant: customerScopedConstant("languageConstants", id),
+        },
+      },
+    });
+  }
+  return operations;
+}
+
+type AppCampaignBundleInput = {
+  customer_id: string;
+  name: string;
+  daily_budget: number;
+  initial_status?: "PAUSED" | "ENABLED";
+  app_id: string;
+  app_store: "GOOGLE_APP_STORE" | "APPLE_APP_STORE";
+  app_campaign_subtype?:
+    | "APP_CAMPAIGN"
+    | "APP_CAMPAIGN_FOR_ENGAGEMENT"
+    | "APP_CAMPAIGN_FOR_PRE_REGISTRATION";
+  bidding_goal:
+    | "OPTIMIZE_INSTALLS_TARGET_INSTALL_COST"
+    | "OPTIMIZE_IN_APP_CONVERSIONS_TARGET_INSTALL_COST"
+    | "OPTIMIZE_IN_APP_CONVERSIONS_TARGET_CONVERSION_COST"
+    | "OPTIMIZE_RETURN_ON_ADVERTISING_SPEND"
+    | "OPTIMIZE_PRE_REGISTRATION_CONVERSION_VOLUME"
+    | "OPTIMIZE_INSTALLS_WITHOUT_TARGET_INSTALL_COST"
+    | "OPTIMIZE_IN_APP_CONVERSIONS_WITHOUT_TARGET_CPA"
+    | "OPTIMIZE_TOTAL_VALUE_WITHOUT_TARGET_ROAS";
+  target_cpa?: number;
+  target_roas?: number;
+  conversion_action_ids?: string[];
+  ad_group_name: string;
+  geo_target_constant_ids?: string[];
+  language_constant_ids?: string[];
+  campaign_fields?: JsonRecord;
+  ad_group_fields?: JsonRecord;
+};
+
+const APP_BIDDING_GOALS = [
+  "OPTIMIZE_INSTALLS_TARGET_INSTALL_COST",
+  "OPTIMIZE_IN_APP_CONVERSIONS_TARGET_INSTALL_COST",
+  "OPTIMIZE_IN_APP_CONVERSIONS_TARGET_CONVERSION_COST",
+  "OPTIMIZE_RETURN_ON_ADVERTISING_SPEND",
+  "OPTIMIZE_PRE_REGISTRATION_CONVERSION_VOLUME",
+  "OPTIMIZE_INSTALLS_WITHOUT_TARGET_INSTALL_COST",
+  "OPTIMIZE_IN_APP_CONVERSIONS_WITHOUT_TARGET_CPA",
+  "OPTIMIZE_TOTAL_VALUE_WITHOUT_TARGET_ROAS",
+] as const;
+
+function registerAppCampaignBundle(server: McpServer) {
+  server.registerTool(
+    "create_app_campaign_bundle",
+    {
+      title: "Create App Campaign Bundle",
+      description:
+        "Atomically create a non-shared budget, configured App campaign, ad group, and campaign geo/language criteria. Add creative with create_app_ad.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1),
+        daily_budget: z.number().positive(),
+        initial_status: CAMPAIGN_STATUS.optional(),
+        app_id: z.string().min(1),
+        app_store: z.enum(["GOOGLE_APP_STORE", "APPLE_APP_STORE"]),
+        app_campaign_subtype: z
+          .enum([
+            "APP_CAMPAIGN",
+            "APP_CAMPAIGN_FOR_ENGAGEMENT",
+            "APP_CAMPAIGN_FOR_PRE_REGISTRATION",
+          ])
+          .optional(),
+        bidding_goal: z.enum(APP_BIDDING_GOALS),
+        target_cpa: z.number().positive().optional(),
+        target_roas: z.number().positive().optional(),
+        conversion_action_ids: z.array(z.string()).optional(),
+        ad_group_name: z.string().min(1),
+        geo_target_constant_ids: z.array(z.string()).optional(),
+        language_constant_ids: z.array(z.string()).optional(),
+        campaign_fields: jsonRecordSchema.optional(),
+        ad_group_fields: jsonRecordSchema.optional(),
+        validate_only: z.boolean().optional(),
+      },
+    },
+    async (params) =>
+      runChannelBundle(
+        "create_app_campaign_bundle",
+        params,
+        buildAppCampaignBundleOperations(params)
+      )
+  );
+}
+
+export function buildAppCampaignBundleOperations(
+  params: AppCampaignBundleInput
+): MutateOperation<unknown>[] {
+  const usesTargetRoas =
+    params.bidding_goal === "OPTIMIZE_RETURN_ON_ADVERTISING_SPEND";
+  const usesMaximizeValue =
+    params.bidding_goal === "OPTIMIZE_TOTAL_VALUE_WITHOUT_TARGET_ROAS";
+  const usesMaximizeConversions =
+    params.bidding_goal === "OPTIMIZE_INSTALLS_WITHOUT_TARGET_INSTALL_COST" ||
+    params.bidding_goal === "OPTIMIZE_IN_APP_CONVERSIONS_WITHOUT_TARGET_CPA";
+  const usesRoas = usesTargetRoas || usesMaximizeValue;
+  if (usesRoas && params.target_cpa != null) {
+    throw new Error("ROAS App goals do not accept target_cpa");
+  }
+  if (!usesRoas && params.target_roas != null) {
+    throw new Error("target_roas requires a ROAS App goal");
+  }
+  if (usesTargetRoas && params.target_roas == null) {
+    throw new Error("target_roas is required for the target ROAS App goal");
+  }
+  if (usesMaximizeValue && params.target_roas != null) {
+    throw new Error("The no-target-ROAS App goal does not accept target_roas");
+  }
+  if (usesMaximizeConversions && params.target_cpa != null) {
+    throw new Error("The no-target-CPA App goals do not accept target_cpa");
+  }
+  if (!usesRoas && !usesMaximizeConversions && params.target_cpa == null) {
+    throw new Error("target_cpa is required for this App bidding goal");
+  }
+  const subtype = params.app_campaign_subtype ?? "APP_CAMPAIGN";
+  if (
+    subtype === "APP_CAMPAIGN_FOR_ENGAGEMENT" &&
+    !params.conversion_action_ids?.length
+  ) {
+    throw new Error(
+      "conversion_action_ids are required for App engagement campaigns"
     );
+  }
+  const customerId = params.customer_id;
+  const budget = ResourceNames.campaignBudget(customerId, "-1");
+  const campaign = ResourceNames.campaign(customerId, "-2");
+  const adGroup = ResourceNames.adGroup(customerId, "-3");
+  const operations: MutateOperation<unknown>[] = [
+    {
+      entity: "campaign_budget",
+      operation: "create",
+      resource: {
+        resource_name: budget,
+        name: `${params.name} budget`,
+        amount_micros: toMicros(params.daily_budget),
+        delivery_method: enums.BudgetDeliveryMethod.STANDARD,
+        explicitly_shared: false,
+      },
+    },
+    {
+      entity: "campaign",
+      operation: "create",
+      resource: {
+        resource_name: campaign,
+        name: params.name,
+        status: enumValue(enums.CampaignStatus, params.initial_status ?? "PAUSED"),
+        advertising_channel_type: enums.AdvertisingChannelType.MULTI_CHANNEL,
+        advertising_channel_sub_type: enumValue(
+          enums.AdvertisingChannelSubType,
+          params.app_campaign_subtype ?? "APP_CAMPAIGN"
+        ),
+        campaign_budget: budget,
+        contains_eu_political_advertising:
+          enums.EuPoliticalAdvertisingStatus
+            .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
+        app_campaign_setting: {
+          app_id: params.app_id,
+          app_store: enumValue(enums.AppCampaignAppStore, params.app_store),
+          bidding_strategy_goal_type: enumValue(
+            enums.AppCampaignBiddingStrategyGoalType,
+            params.bidding_goal
+          ),
+        },
+        ...(params.conversion_action_ids?.length
+          ? {
+              selective_optimization: {
+                conversion_actions: params.conversion_action_ids.map((id) =>
+                  toResourceName(params.customer_id, "conversionActions", id)
+                ),
+              },
+            }
+          : {}),
+        ...(subtype === "APP_CAMPAIGN_FOR_PRE_REGISTRATION"
+          ? {
+              optimization_goal_setting: {
+                optimization_goal_types: [
+                  enums.OptimizationGoalType.APP_PRE_REGISTRATION,
+                ],
+              },
+            }
+          : {}),
+        ...(usesTargetRoas
+          ? {
+              target_roas: {
+                ...(params.target_roas != null
+                  ? { target_roas: params.target_roas }
+                  : {}),
+              },
+            }
+          : usesMaximizeValue
+            ? { maximize_conversion_value: {} }
+            : usesMaximizeConversions
+              ? { maximize_conversions: {} }
+              : {
+                  target_cpa: {
+                    ...(params.target_cpa != null
+                      ? { target_cpa_micros: toMicros(params.target_cpa) }
+                      : {}),
+                  },
+                }),
+        ...(params.campaign_fields ?? {}),
+      },
+    },
+    {
+      entity: "ad_group",
+      operation: "create",
+      resource: {
+        resource_name: adGroup,
+        campaign,
+        name: params.ad_group_name,
+        status: enums.AdGroupStatus.ENABLED,
+        ...(params.ad_group_fields ?? {}),
+      },
+    },
+  ];
+  for (const id of params.geo_target_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign,
+        location: {
+          geo_target_constant: customerScopedConstant("geoTargetConstants", id),
+        },
+      },
+    });
+  }
+  for (const id of params.language_constant_ids ?? []) {
+    operations.push({
+      entity: "campaign_criterion",
+      operation: "create",
+      resource: {
+        campaign,
+        language: {
+          language_constant: customerScopedConstant("languageConstants", id),
+        },
+      },
+    });
+  }
+  return operations;
+}
+
+async function runChannelBundle(
+  tool: string,
+  params: { customer_id: string; validate_only?: boolean },
+  operations: MutateOperation<unknown>[]
+) {
+  try {
+    const result = await getAdsClient(params.customer_id).mutateResources(
+      operations,
+      { validate_only: params.validate_only ?? false }
+    );
+    return mcpSuccess({
+      tool,
+      customer_id: params.customer_id,
+      validate_only: params.validate_only ?? false,
+      resource_names: extractResourceNames(result),
+      results: { operation_count: operations.length, response: result },
+      request_id: extractRequestId(result),
+    });
+  } catch (err) {
+    return mcpJsonError(tool, err, {
+      customer_id: params.customer_id,
+      validate_only: params.validate_only,
+    });
   }
 }
 
