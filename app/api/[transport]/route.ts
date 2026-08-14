@@ -16,6 +16,7 @@ import { registerGenericAdminTools } from "@/tools/admin-generic";
 import { registerBiddingAdminTools } from "@/tools/bidding-admin";
 import { registerAudienceTargetingTools } from "@/tools/audience-targeting";
 import { registerAutomationTools } from "@/tools/automation";
+import { registerApiCapabilityTools } from "@/tools/api-capabilities";
 
 const handler = createMcpHandler(
   (server) => {
@@ -35,6 +36,7 @@ const handler = createMcpHandler(
     registerBiddingAdminTools(server);
     registerAudienceTargetingTools(server);
     registerAutomationTools(server);
+    registerApiCapabilityTools(server);
   },
   {
     serverInfo: {
