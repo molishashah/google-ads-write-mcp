@@ -8,7 +8,25 @@ import {
   toResourceName,
 } from "@/lib/google-ads-utils";
 import { mcpJsonError, mcpSuccess, mcpText, mcpError } from "@/lib/mcp-helpers";
-import { jsonRecordSchema, mutateOptionSchema, registerCollectionMutateTool } from "@/tools/tool-utils";
+import {
+  jsonRecordSchema,
+  mutateOptionSchema,
+  mutateOptions,
+  registerCollectionMutateTool,
+} from "@/tools/tool-utils";
+
+const TYPED_EXPERIMENT_TYPES = [
+  "AD_VARIATION",
+  "SEARCH_CUSTOM",
+  "DISPLAY_CUSTOM",
+  "DISPLAY_AUTOMATED_BIDDING_STRATEGY",
+  "SEARCH_AUTOMATED_BIDDING_STRATEGY",
+  "SHOPPING_AUTOMATED_BIDDING_STRATEGY",
+  "OPTIMIZE_ASSETS",
+  "ADOPT_AI_MAX",
+  "ADOPT_BROAD_MATCH_KEYWORDS",
+  "PMAX_REPLACEMENT_SHOPPING",
+] as const;
 
 // ──────────────────────────────────────────────────────────────────────
 // Ad Variation experiment tools
@@ -44,6 +62,7 @@ export function registerExperimentTools(server: McpServer) {
 }
 
 function registerExperimentAdminTools(server: McpServer) {
+  registerTypedExperimentCreationTools(server);
   server.registerTool(
     "list_experiments",
     {
@@ -125,6 +144,165 @@ function registerExperimentAdminTools(server: McpServer) {
     action: "update",
     resourceLabel: "Experiment",
   });
+}
+
+function registerTypedExperimentCreationTools(server: McpServer) {
+  server.registerTool(
+    "create_experiment",
+    {
+      title: "Create Experiment",
+      description:
+        "Create a typed experiment shell in SETUP status. Add arms before scheduling.",
+      inputSchema: {
+        customer_id: z.string(),
+        name: z.string().min(1).max(64),
+        type: z.enum(TYPED_EXPERIMENT_TYPES),
+        suffix: z.string().max(64).optional(),
+        start_date: z.string().optional(),
+        end_date: z.string().optional(),
+        fields: jsonRecordSchema.optional(),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_experiment";
+      try {
+        const resource = buildExperimentResource(params);
+        const result = await getAdsClient(params.customer_id).experiments.create(
+          [resource] as never[],
+          mutateOptions(params)
+        );
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: { resource, response: result },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+
+  server.registerTool(
+    "create_experiment_arms",
+    {
+      title: "Create Experiment Arms",
+      description:
+        "Create control and treatment arms with validated traffic splits. Treatment draft campaigns are returned when supported.",
+      inputSchema: {
+        customer_id: z.string(),
+        experiment_id: z.string(),
+        arms: z
+          .array(
+            z.object({
+              name: z.string().min(1),
+              control: z.boolean(),
+              traffic_split: z.number().int().min(1).max(99),
+              campaign_ids: z.array(z.string()).optional(),
+              fields: jsonRecordSchema.optional(),
+            })
+          )
+          .min(2),
+        ...mutateOptionSchema,
+      },
+    },
+    async (params) => {
+      const tool = "create_experiment_arms";
+      try {
+        const resources = buildExperimentArms(params);
+        const result = await getAdsClient(
+          params.customer_id
+        ).experimentArms.create(resources as never[], {
+          ...mutateOptions(params),
+          response_content_type: enums.ResponseContentType.MUTABLE_RESOURCE,
+        });
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          resource_names: extractResourceNames(result),
+          results: { resources, response: result },
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
+  );
+}
+
+export function buildExperimentResource(params: {
+  name: string;
+  type: (typeof TYPED_EXPERIMENT_TYPES)[number];
+  suffix?: string;
+  start_date?: string;
+  end_date?: string;
+  fields?: Record<string, unknown>;
+}) {
+  return {
+    name: params.name,
+    type: enums.ExperimentType[params.type],
+    status: enums.ExperimentStatus.SETUP,
+    suffix: params.suffix ?? ` [${params.name}]`,
+    ...(params.start_date ? { start_date: params.start_date } : {}),
+    ...(params.end_date ? { end_date: params.end_date } : {}),
+    ...(params.fields ?? {}),
+  };
+}
+
+export function buildExperimentArms(params: {
+  customer_id: string;
+  experiment_id: string;
+  arms: Array<{
+    name: string;
+    control: boolean;
+    traffic_split: number;
+    campaign_ids?: string[];
+    fields?: Record<string, unknown>;
+  }>;
+}) {
+  const controls = params.arms.filter((arm) => arm.control);
+  if (controls.length !== 1) {
+    throw new Error("Exactly one experiment arm must be the control.");
+  }
+  const split = params.arms.reduce(
+    (total, arm) => total + arm.traffic_split,
+    0
+  );
+  if (split !== 100) {
+    throw new Error(`Experiment arm traffic splits must total 100, got ${split}.`);
+  }
+  if (!controls[0].campaign_ids?.length) {
+    throw new Error("The control arm must include at least one campaign_id.");
+  }
+  const experiment = toResourceName(
+    params.customer_id,
+    "experiments",
+    params.experiment_id
+  );
+  return params.arms.map((arm) => ({
+    experiment,
+    name: arm.name,
+    control: arm.control,
+    traffic_split: arm.traffic_split,
+    ...(arm.campaign_ids?.length
+      ? {
+          campaigns: arm.campaign_ids.map((id) =>
+            toResourceName(params.customer_id, "campaigns", id)
+          ),
+        }
+      : {}),
+    ...(arm.fields ?? {}),
+  }));
 }
 
 function registerExperimentRpcTool(
