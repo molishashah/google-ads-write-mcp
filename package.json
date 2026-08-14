@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:ads-api-version": "node scripts/check-google-ads-version.mjs",
+    "check:ads-api-target": "node scripts/check-google-ads-version.mjs --require-target"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.26.0",

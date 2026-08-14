@@ -34,7 +34,13 @@ The MCP endpoint is served at `/api/[transport]` and protected by `withMcpAuth`.
 
 - **Next.js 16** (App Router) on **React 19**
 - [`mcp-handler`](https://www.npmjs.com/package/mcp-handler) + [`@modelcontextprotocol/sdk`](https://www.npmjs.com/package/@modelcontextprotocol/sdk)
-- [`google-ads-api`](https://www.npmjs.com/package/google-ads-api) v24.1.0 (Ads API client)
+- [`google-ads-api`](https://www.npmjs.com/package/google-ads-api) v24.1.0 (generated Ads API v24 client with v24.1 additive fields)
+
+The current migration target is Google Ads API v25. Run `npm run check:ads-api-version`
+to inspect the installed generated version. `npm run check:ads-api-target` is the
+strict CI gate to enable once an upstream Node client generated from v25 is available;
+until then, the MCP reports v25-only fields as deferred rather than sending them through
+v24 protos.
 - `google-auth-library` + `jose` for OAuth and JWT
 - `zod` for tool input validation
 
