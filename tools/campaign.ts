@@ -18,6 +18,7 @@ import {
   TARGET_IMPRESSION_SHARE_LOCATIONS,
   type SearchCampaignBiddingInput,
 } from "@/tools/campaign-bidding";
+import { buildCampaignDateTimeFields } from "@/tools/campaign-fields";
 
 // ──────────────────────────────────────────────────────────────────────
 // Campaign structure tools (create campaign + ad group)
@@ -102,8 +103,7 @@ export function buildCreateCampaignOperations(
           target_content_network: params.include_display_network ?? false,
           target_partner_search_network: false,
         },
-        ...(params.start_date ? { start_date: params.start_date } : {}),
-        ...(params.end_date ? { end_date: params.end_date } : {}),
+        ...buildCampaignDateTimeFields(params),
       },
     },
   ];

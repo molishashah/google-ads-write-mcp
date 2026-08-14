@@ -153,8 +153,16 @@ describe("buildSearchCampaignBundleOperations", () => {
       advertising_channel_type: enums.AdvertisingChannelType.PERFORMANCE_MAX,
       campaign_budget: "customers/123/campaignBudgets/-1",
       maximize_conversion_value: { target_roas: 2.5 },
-      url_expansion_opt_out: true,
+      asset_automation_settings: [
+        {
+          asset_automation_type:
+            enums.AssetAutomationType
+              .FINAL_URL_EXPANSION_TEXT_ASSET_AUTOMATION,
+          asset_automation_status: enums.AssetAutomationStatus.OPTED_OUT,
+        },
+      ],
     });
+    expect(operations[1].resource).not.toHaveProperty("url_expansion_opt_out");
     expect(operations[2].resource).toMatchObject({
       resource_name: "customers/123/assetGroups/-3",
       campaign: "customers/123/campaigns/-2",

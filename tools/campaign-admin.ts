@@ -24,6 +24,10 @@ import {
   type TargetImpressionShareLocation,
 } from "@/tools/campaign-bidding";
 import {
+  buildCampaignDateTimeFields,
+  buildFinalUrlExpansionAutomation,
+} from "@/tools/campaign-fields";
+import {
   jsonRecordSchema,
   mutateOptions,
   mutateOptionSchema,
@@ -567,8 +571,7 @@ function registerBudgetTools(server: McpServer) {
       end_date: z.string().regex(DATE_RE).optional(),
     },
     build: (params) => ({
-      ...(params.start_date ? { start_date: params.start_date } : {}),
-      ...(params.end_date ? { end_date: params.end_date } : {}),
+      ...buildCampaignDateTimeFields(params),
     }),
   });
 
@@ -1095,8 +1098,7 @@ export function buildSearchCampaignBundleOperations(
           target_content_network: params.include_display_network ?? false,
           target_partner_search_network: false,
         },
-        ...(params.start_date ? { start_date: params.start_date } : {}),
-        ...(params.end_date ? { end_date: params.end_date } : {}),
+        ...buildCampaignDateTimeFields(params),
       },
     },
   ];
@@ -1411,8 +1413,7 @@ export function buildShoppingCampaignBundleOperations(
             : {}),
         },
         ...buildShoppingBiddingStrategy(params),
-        ...(params.start_date ? { start_date: params.start_date } : {}),
-        ...(params.end_date ? { end_date: params.end_date } : {}),
+        ...buildCampaignDateTimeFields(params),
         ...(params.campaign_fields ?? {}),
       },
     },
@@ -1629,11 +1630,10 @@ export function buildPerformanceMaxCampaignBundleOperations(
           enums.EuPoliticalAdvertisingStatus
             .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
         ...buildPerformanceMaxBiddingStrategy(params),
-        ...(params.final_url_expansion_opt_out != null
-          ? { url_expansion_opt_out: params.final_url_expansion_opt_out }
-          : {}),
-        ...(params.start_date ? { start_date: params.start_date } : {}),
-        ...(params.end_date ? { end_date: params.end_date } : {}),
+        ...buildFinalUrlExpansionAutomation(
+          params.final_url_expansion_opt_out
+        ),
+        ...buildCampaignDateTimeFields(params),
         ...(params.campaign_fields ?? {}),
       },
     },
