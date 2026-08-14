@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { enums } from "google-ads-api";
 import {
   buildCampaignConversionGoalResourceName,
+  buildCallConversion,
   buildConversionActionResource,
+  buildConversionAdjustment,
   buildConversionCustomVariableResource,
   buildConversionValueRuleResource,
   buildCustomerConversionGoalResourceName,
@@ -105,5 +107,63 @@ describe("conversion setup helpers", () => {
         user_interests: ["userInterests/999"],
       },
     });
+  });
+
+  it("builds a typed call conversion with custom values and consent", () => {
+    expect(
+      buildCallConversion("123", {
+        conversion_action: "456",
+        caller_id: "+14155550100",
+        call_start_date_time: "2026-08-01 10:00:00-07:00",
+        conversion_date_time: "2026-08-01 10:05:00-07:00",
+        conversion_value: 100,
+        currency_code: "USD",
+        custom_variables: [
+          { conversion_custom_variable: "789", value: "enterprise" },
+        ],
+        consent: { adUserData: "GRANTED" },
+      })
+    ).toMatchObject({
+      conversion_action: "customers/123/conversionActions/456",
+      caller_id: "+14155550100",
+      conversion_value: 100,
+      custom_variables: [
+        {
+          conversion_custom_variable:
+            "customers/123/conversionCustomVariables/789",
+          value: "enterprise",
+        },
+      ],
+      consent: { ad_user_data: enums.ConsentStatus.GRANTED },
+    });
+  });
+
+  it("builds typed conversion restatements", () => {
+    expect(
+      buildConversionAdjustment("123", {
+        conversion_action: "456",
+        adjustment_type: "RESTATEMENT",
+        adjustment_date_time: "2026-08-02 10:00:00-07:00",
+        order_id: "order-1",
+        adjusted_value: 250,
+        currency_code: "USD",
+      })
+    ).toEqual({
+      conversion_action: "customers/123/conversionActions/456",
+      adjustment_type: enums.ConversionAdjustmentType.RESTATEMENT,
+      adjustment_date_time: "2026-08-02 10:00:00-07:00",
+      order_id: "order-1",
+      restatement_value: { adjusted_value: 250, currency_code: "USD" },
+    });
+  });
+
+  it("requires a complete adjustment identifier", () => {
+    expect(() =>
+      buildConversionAdjustment("123", {
+        conversion_action: "456",
+        adjustment_type: "RETRACTION",
+        adjustment_date_time: "2026-08-02 10:00:00-07:00",
+      })
+    ).toThrow("Provide order_id");
   });
 });

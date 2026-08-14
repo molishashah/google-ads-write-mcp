@@ -106,6 +106,7 @@ type NormalizedClickConversion = {
   conversionDateTime: string;
   orderId: string;
   hashedEmail: string;
+  hashedPhoneNumber: string;
   gclid?: string;
   gbraid?: string;
   wbraid?: string;
@@ -117,6 +118,11 @@ type NormalizedClickConversion = {
   };
   conversionEnvironment?: "APP" | "WEB" | "UNSPECIFIED" | "UNKNOWN";
   customerType?: "NEW" | "RETURNING" | "UNSPECIFIED" | "UNKNOWN";
+  customVariables?: Array<{
+    conversionCustomVariable: string;
+    value: string;
+  }>;
+  cartData?: Record<string, unknown>;
 };
 
 type RawClickConversion = {
@@ -130,6 +136,10 @@ type RawClickConversion = {
   hashed_email?: string;
   emailSha256?: string;
   email_sha256?: string;
+  hashedPhoneNumber?: string;
+  hashed_phone_number?: string;
+  phoneSha256?: string;
+  phone_sha256?: string;
   gclid?: string;
   gbraid?: string;
   wbraid?: string;
@@ -142,6 +152,10 @@ type RawClickConversion = {
   conversion_environment?: NormalizedClickConversion["conversionEnvironment"];
   customerType?: NormalizedClickConversion["customerType"];
   customer_type?: NormalizedClickConversion["customerType"];
+  customVariables?: NormalizedClickConversion["customVariables"];
+  custom_variables?: NormalizedClickConversion["customVariables"];
+  cartData?: Record<string, unknown>;
+  cart_data?: Record<string, unknown>;
 };
 
 export type ConversionActionSetupInput = {
@@ -232,6 +246,10 @@ const clickConversionSchema = z.object({
   hashed_email: z.string().optional(),
   emailSha256: z.string().optional(),
   email_sha256: z.string().optional(),
+  hashedPhoneNumber: z.string().optional(),
+  hashed_phone_number: z.string().optional(),
+  phoneSha256: z.string().optional(),
+  phone_sha256: z.string().optional(),
   gclid: z.string().optional(),
   gbraid: z.string().optional(),
   wbraid: z.string().optional(),
@@ -248,6 +266,24 @@ const clickConversionSchema = z.object({
     .optional(),
   customerType: z.enum(["NEW", "RETURNING", "UNSPECIFIED", "UNKNOWN"]).optional(),
   customer_type: z.enum(["NEW", "RETURNING", "UNSPECIFIED", "UNKNOWN"]).optional(),
+  customVariables: z
+    .array(
+      z.object({
+        conversionCustomVariable: z.string(),
+        value: z.string(),
+      })
+    )
+    .optional(),
+  custom_variables: z
+    .array(
+      z.object({
+        conversionCustomVariable: z.string(),
+        value: z.string(),
+      })
+    )
+    .optional(),
+  cartData: jsonRecordSchema.optional(),
+  cart_data: jsonRecordSchema.optional(),
 });
 
 export function registerConversionTools(server: McpServer) {
@@ -1395,11 +1431,78 @@ function registerUploadClickConversions(server: McpServer) {
 }
 
 function registerAdditionalUploadTools(server: McpServer) {
-  registerUploadRpcTool(
-    server,
+  server.registerTool(
     "upload_call_conversions",
-    "uploadCallConversions",
-    "Upload call conversions through ConversionUploadService."
+    {
+      title: "Upload Call Conversions",
+      description:
+        "Upload typed call conversions with partial-failure, validation, and job diagnostics. A raw request remains available for advanced fields.",
+      inputSchema: {
+        customer_id: z.string(),
+        conversions: z
+          .array(
+            z.object({
+              conversion_action: z.string(),
+              caller_id: z.string().min(1),
+              call_start_date_time: z.string().regex(GOOGLE_DATE_TIME_RE),
+              conversion_date_time: z.string().regex(GOOGLE_DATE_TIME_RE),
+              conversion_value: z.number().finite().optional(),
+              currency_code: z.string().length(3).optional(),
+              order_id: z.string().optional(),
+              custom_variables: z
+                .array(
+                  z.object({
+                    conversion_custom_variable: z.string(),
+                    value: z.string(),
+                  })
+                )
+                .optional(),
+              consent: consentSchema,
+              fields: jsonRecordSchema.optional(),
+            })
+          )
+          .min(1)
+          .optional(),
+        request: jsonRecordSchema.optional(),
+        partial_failure: z.boolean().optional(),
+        validate_only: z.boolean().optional(),
+        job_id: z.number().int().nonnegative().max(2147483647).optional(),
+      },
+    },
+    async (params) => {
+      const tool = "upload_call_conversions";
+      try {
+        if (!params.request && !params.conversions?.length) {
+          throw new Error("Provide conversions or a raw request.");
+        }
+        const request = params.request ?? {
+          conversions: params.conversions!.map((conversion) =>
+            buildCallConversion(params.customer_id, conversion)
+          ),
+          partial_failure: params.partial_failure ?? true,
+          validate_only: params.validate_only ?? false,
+          ...(params.job_id != null ? { job_id: params.job_id } : {}),
+        };
+        const result = await getAdsClient(
+          params.customer_id
+        ).conversionUploads.uploadCallConversions({
+          customer_id: params.customer_id,
+          ...request,
+        } as never);
+        return mcpSuccess({
+          tool,
+          customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
+          results: result,
+          request_id: extractRequestId(result),
+        });
+      } catch (err) {
+        return mcpJsonError(tool, err, {
+          customer_id: params.customer_id,
+          validate_only: params.validate_only,
+        });
+      }
+    }
   );
 
   server.registerTool(
@@ -1409,21 +1512,67 @@ function registerAdditionalUploadTools(server: McpServer) {
       description: "Upload conversion adjustments through ConversionAdjustmentUploadService.",
       inputSchema: {
         customer_id: z.string(),
-        request: jsonRecordSchema,
+        adjustments: z
+          .array(
+            z.object({
+              conversion_action: z.string(),
+              adjustment_type: z.enum([
+                "RETRACTION",
+                "RESTATEMENT",
+                "ENHANCEMENT",
+              ]),
+              adjustment_date_time: z.string().regex(GOOGLE_DATE_TIME_RE),
+              order_id: z.string().optional(),
+              gclid: z.string().optional(),
+              conversion_date_time: z.string().regex(GOOGLE_DATE_TIME_RE).optional(),
+              adjusted_value: z.number().finite().optional(),
+              currency_code: z.string().length(3).optional(),
+              user_identifiers: z
+                .array(
+                  z.object({
+                    hashed_email: z.string().regex(SHA256_HEX_ANY_CASE_RE).optional(),
+                    hashed_phone_number: z
+                      .string()
+                      .regex(SHA256_HEX_ANY_CASE_RE)
+                      .optional(),
+                  })
+                )
+                .optional(),
+              fields: jsonRecordSchema.optional(),
+            })
+          )
+          .min(1)
+          .optional(),
+        request: jsonRecordSchema.optional(),
+        partial_failure: z.boolean().optional(),
+        validate_only: z.boolean().optional(),
+        job_id: z.number().int().nonnegative().max(2147483647).optional(),
       },
     },
     async (params) => {
       const tool = "upload_conversion_adjustments";
       try {
+        if (!params.request && !params.adjustments?.length) {
+          throw new Error("Provide adjustments or a raw request.");
+        }
+        const request = params.request ?? {
+          conversion_adjustments: params.adjustments!.map((adjustment) =>
+            buildConversionAdjustment(params.customer_id, adjustment)
+          ),
+          partial_failure: params.partial_failure ?? true,
+          validate_only: params.validate_only ?? false,
+          ...(params.job_id != null ? { job_id: params.job_id } : {}),
+        };
         const customer = getAdsClient(params.customer_id);
         const result =
           await customer.conversionAdjustmentUploads.uploadConversionAdjustments({
             customer_id: params.customer_id,
-            ...params.request,
+            ...request,
           } as never);
         return mcpSuccess({
           tool,
           customer_id: params.customer_id,
+          validate_only: params.validate_only ?? false,
           results: result,
           request_id: extractRequestId(result),
         });
@@ -1461,6 +1610,166 @@ function registerAdditionalUploadTools(server: McpServer) {
         },
       })
   );
+}
+
+type CallConversionInput = {
+  conversion_action: string;
+  caller_id: string;
+  call_start_date_time: string;
+  conversion_date_time: string;
+  conversion_value?: number;
+  currency_code?: string;
+  order_id?: string;
+  custom_variables?: Array<{
+    conversion_custom_variable: string;
+    value: string;
+  }>;
+  consent?: {
+    adUserData?: "GRANTED" | "DENIED" | "UNSPECIFIED";
+    adPersonalization?: "GRANTED" | "DENIED" | "UNSPECIFIED";
+  };
+  fields?: Record<string, unknown>;
+};
+
+export function buildCallConversion(
+  customerId: string,
+  params: CallConversionInput
+) {
+  return {
+    conversion_action: toResourceName(
+      customerId,
+      "conversionActions",
+      params.conversion_action
+    ),
+    caller_id: params.caller_id,
+    call_start_date_time: params.call_start_date_time,
+    conversion_date_time: params.conversion_date_time,
+    ...(params.conversion_value != null
+      ? { conversion_value: params.conversion_value }
+      : {}),
+    ...(params.currency_code ? { currency_code: params.currency_code } : {}),
+    ...(params.order_id ? { order_id: params.order_id } : {}),
+    ...(params.custom_variables?.length
+      ? {
+          custom_variables: params.custom_variables.map((entry) => ({
+            conversion_custom_variable: toResourceName(
+              customerId,
+              "conversionCustomVariables",
+              entry.conversion_custom_variable
+            ),
+            value: entry.value,
+          })),
+        }
+      : {}),
+    ...(params.consent
+      ? {
+          consent: {
+            ...(params.consent.adUserData
+              ? {
+                  ad_user_data: enumValue(
+                    enums.ConsentStatus,
+                    params.consent.adUserData
+                  ),
+                }
+              : {}),
+            ...(params.consent.adPersonalization
+              ? {
+                  ad_personalization: enumValue(
+                    enums.ConsentStatus,
+                    params.consent.adPersonalization
+                  ),
+                }
+              : {}),
+          },
+        }
+      : {}),
+    ...(params.fields ?? {}),
+  };
+}
+
+type ConversionAdjustmentInput = {
+  conversion_action: string;
+  adjustment_type: "RETRACTION" | "RESTATEMENT" | "ENHANCEMENT";
+  adjustment_date_time: string;
+  order_id?: string;
+  gclid?: string;
+  conversion_date_time?: string;
+  adjusted_value?: number;
+  currency_code?: string;
+  user_identifiers?: Array<{
+    hashed_email?: string;
+    hashed_phone_number?: string;
+  }>;
+  fields?: Record<string, unknown>;
+};
+
+export function buildConversionAdjustment(
+  customerId: string,
+  params: ConversionAdjustmentInput
+) {
+  if (!params.order_id && !(params.gclid && params.conversion_date_time)) {
+    throw new Error(
+      "Provide order_id or both gclid and conversion_date_time to identify the conversion."
+    );
+  }
+  if (
+    params.adjustment_type === "RESTATEMENT" &&
+    (params.adjusted_value == null || !params.currency_code)
+  ) {
+    throw new Error(
+      "RESTATEMENT requires adjusted_value and currency_code."
+    );
+  }
+  if (
+    params.adjustment_type === "ENHANCEMENT" &&
+    !params.user_identifiers?.length
+  ) {
+    throw new Error("ENHANCEMENT requires user_identifiers.");
+  }
+  return {
+    conversion_action: toResourceName(
+      customerId,
+      "conversionActions",
+      params.conversion_action
+    ),
+    adjustment_type: enumValue(
+      enums.ConversionAdjustmentType,
+      params.adjustment_type
+    ),
+    adjustment_date_time: params.adjustment_date_time,
+    ...(params.order_id
+      ? { order_id: params.order_id }
+      : {
+          gclid_date_time_pair: {
+            gclid: params.gclid,
+            conversion_date_time: params.conversion_date_time,
+          },
+        }),
+    ...(params.adjustment_type === "RESTATEMENT"
+      ? {
+          restatement_value: {
+            adjusted_value: params.adjusted_value,
+            currency_code: params.currency_code,
+          },
+        }
+      : {}),
+    ...(params.user_identifiers?.length
+      ? {
+          user_identifiers: params.user_identifiers.map((identifier) => ({
+            ...(identifier.hashed_email
+              ? { hashed_email: identifier.hashed_email.toLowerCase() }
+              : {}),
+            ...(identifier.hashed_phone_number
+              ? {
+                  hashed_phone_number:
+                    identifier.hashed_phone_number.toLowerCase(),
+                }
+              : {}),
+          })),
+        }
+      : {}),
+    ...(params.fields ?? {}),
+  };
 }
 
 function registerGetOfflineConversionDiagnostics(server: McpServer) {
@@ -1660,45 +1969,6 @@ function registerGoalQueryTool(
   );
 }
 
-function registerUploadRpcTool(
-  server: McpServer,
-  toolName: string,
-  method: "uploadCallConversions",
-  description: string
-) {
-  server.registerTool(
-    toolName,
-    {
-      title: toolName
-        .split("_")
-        .map((part) => part[0].toUpperCase() + part.slice(1))
-        .join(" "),
-      description,
-      inputSchema: {
-        customer_id: z.string(),
-        request: jsonRecordSchema,
-      },
-    },
-    async (params) => {
-      try {
-        const customer = getAdsClient(params.customer_id);
-        const result = await customer.conversionUploads[method]({
-          customer_id: params.customer_id,
-          ...params.request,
-        } as never);
-        return mcpSuccess({
-          tool: toolName,
-          customer_id: params.customer_id,
-          results: result,
-          request_id: extractRequestId(result),
-        });
-      } catch (err) {
-        return mcpJsonError(toolName, err, { customer_id: params.customer_id });
-      }
-    }
-  );
-}
-
 async function fetchConversionTrackingSetting(customerId: string) {
   const customer = getAdsClient(customerId);
   const rows = await customer.query<
@@ -1866,14 +2136,15 @@ function validateConversions(
       orderIds.add(dedupeKey);
     }
 
-    if (!conversion.hashedEmail) {
+    if (!conversion.hashedEmail && !conversion.hashedPhoneNumber) {
       errors.push({
         index,
-        field: "hashedEmail",
+        field: "hashedEmail/hashedPhoneNumber",
         class: "data",
-        message: "hashedEmail/emailSha256 is required for EC4L uploads.",
+        message:
+          "At least one SHA-256 hashed email or phone number is required for EC4L uploads.",
       });
-    } else if (!SHA256_HEX_RE.test(conversion.hashedEmail)) {
+    } else if (conversion.hashedEmail && !SHA256_HEX_RE.test(conversion.hashedEmail)) {
       if (SHA256_HEX_ANY_CASE_RE.test(conversion.hashedEmail)) {
         warnings.push({
           index,
@@ -1889,6 +2160,30 @@ function validateConversions(
           class: "data",
           message:
             "hashedEmail must be a 64-character SHA-256 hex digest, not a raw email.",
+        });
+      }
+    }
+
+    if (
+      conversion.hashedPhoneNumber &&
+      !SHA256_HEX_RE.test(conversion.hashedPhoneNumber)
+    ) {
+      if (SHA256_HEX_ANY_CASE_RE.test(conversion.hashedPhoneNumber)) {
+        warnings.push({
+          index,
+          field: "hashedPhoneNumber",
+          class: "data",
+          message: "hashedPhoneNumber was normalized to lowercase SHA-256 hex.",
+        });
+        conversion.hashedPhoneNumber =
+          conversion.hashedPhoneNumber.toLowerCase();
+      } else {
+        errors.push({
+          index,
+          field: "hashedPhoneNumber",
+          class: "data",
+          message:
+            "hashedPhoneNumber must be a 64-character SHA-256 hex digest, not a raw phone number.",
         });
       }
     }
@@ -1978,6 +2273,13 @@ function normalizeInputConversion(raw: RawClickConversion) {
       raw.email_sha256 ??
       ""
     ).trim(),
+    hashedPhoneNumber: (
+      raw.hashedPhoneNumber ??
+      raw.hashed_phone_number ??
+      raw.phoneSha256 ??
+      raw.phone_sha256 ??
+      ""
+    ).trim(),
     gclid: trimOptional(raw.gclid),
     gbraid: trimOptional(raw.gbraid),
     wbraid: trimOptional(raw.wbraid),
@@ -1987,6 +2289,8 @@ function normalizeInputConversion(raw: RawClickConversion) {
     conversionEnvironment:
       raw.conversionEnvironment ?? raw.conversion_environment,
     customerType: raw.customerType ?? raw.customer_type,
+    customVariables: raw.customVariables ?? raw.custom_variables,
+    cartData: raw.cartData ?? raw.cart_data,
   };
 }
 
@@ -1995,7 +2299,14 @@ function toGoogleClickConversion(conversion: NormalizedClickConversion) {
     conversion_action: conversion.conversionAction,
     conversion_date_time: conversion.conversionDateTime,
     order_id: conversion.orderId,
-    user_identifiers: [{ hashed_email: conversion.hashedEmail }],
+    user_identifiers: [
+      ...(conversion.hashedEmail
+        ? [{ hashed_email: conversion.hashedEmail }]
+        : []),
+      ...(conversion.hashedPhoneNumber
+        ? [{ hashed_phone_number: conversion.hashedPhoneNumber }]
+        : []),
+    ],
     ...(conversion.gclid ? { gclid: conversion.gclid } : {}),
     ...(conversion.gbraid ? { gbraid: conversion.gbraid } : {}),
     ...(conversion.wbraid ? { wbraid: conversion.wbraid } : {}),
@@ -2041,7 +2352,30 @@ function toGoogleClickConversion(conversion: NormalizedClickConversion) {
           ),
         }
       : {}),
+    ...(conversion.customVariables?.length
+      ? {
+          custom_variables: conversion.customVariables.map((entry) => ({
+            conversion_custom_variable: normalizeConversionCustomVariable(
+              conversion.conversionAction,
+              entry.conversionCustomVariable
+            ),
+            value: entry.value,
+          })),
+        }
+      : {}),
+    ...(conversion.cartData ? { cart_data: conversion.cartData } : {}),
   };
+}
+
+function normalizeConversionCustomVariable(
+  conversionAction: string,
+  value: string
+) {
+  if (value.includes("/")) return value;
+  const customerId = CONVERSION_ACTION_RE.exec(conversionAction)?.[1];
+  return customerId
+    ? toResourceName(customerId, "conversionCustomVariables", value)
+    : value;
 }
 
 function decodePartialFailure(
