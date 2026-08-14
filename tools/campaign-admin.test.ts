@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { enums } from "google-ads-api";
 import {
   buildListCampaignsQuery,
+  buildBiddingStrategy,
   buildPerformanceMaxCampaignBundleOperations,
   buildSearchCampaignBundleOperations,
   buildShoppingCampaignBundleOperations,
@@ -87,6 +88,35 @@ describe("buildSearchCampaignBundleOperations", () => {
         },
       },
     });
+  });
+
+  it("maps Target Impression Share fields for Search bundles", () => {
+    const operations = buildSearchCampaignBundleOperations({
+      customer_id: "123",
+      name: "Brand Search",
+      daily_budget: 25,
+      bidding_strategy: "TARGET_IMPRESSION_SHARE",
+      target_impression_share_location: "ABSOLUTE_TOP_OF_PAGE",
+      target_impression_share_percentage: 92.5,
+      cpc_bid_ceiling: 3.75,
+      ad_groups: [
+        {
+          name: "Brand",
+          final_url: "https://example.com",
+          headlines: ["One", "Two", "Three"],
+          descriptions: ["First description", "Second description"],
+        },
+      ],
+    });
+
+    expect(operations[1].resource).toMatchObject({
+      target_impression_share: {
+        location: enums.TargetImpressionShareLocation.ABSOLUTE_TOP_OF_PAGE,
+        location_fraction_micros: 925_000,
+        cpc_bid_ceiling_micros: 3_750_000,
+      },
+    });
+    expect(operations[1].resource).not.toHaveProperty("target_spend");
   });
 
   it("builds one atomic Performance Max campaign bundle with asset group links", () => {
@@ -185,5 +215,60 @@ describe("buildSearchCampaignBundleOperations", () => {
       status: enums.AdGroupAdStatus.ENABLED,
       ad: { shopping_product_ad: {} },
     });
+  });
+});
+
+describe("buildBiddingStrategy", () => {
+  it("builds an absolute-top Target Impression Share update", () => {
+    expect(
+      buildBiddingStrategy({
+        strategy: "TARGET_IMPRESSION_SHARE",
+        target_impression_share_location: "ABSOLUTE_TOP_OF_PAGE",
+        target_impression_share_percentage: 80,
+        cpc_bid_ceiling: 5,
+      })
+    ).toEqual({
+      target_impression_share: {
+        location: enums.TargetImpressionShareLocation.ABSOLUTE_TOP_OF_PAGE,
+        location_fraction_micros: 800_000,
+        cpc_bid_ceiling_micros: 5_000_000,
+      },
+    });
+  });
+
+  it.each([
+    [
+      {
+        strategy: "TARGET_IMPRESSION_SHARE",
+        target_impression_share_percentage: 80,
+        cpc_bid_ceiling: 5,
+      },
+      "target_impression_share_location is required",
+    ],
+    [
+      {
+        strategy: "TARGET_IMPRESSION_SHARE",
+        target_impression_share_location: "TOP_OF_PAGE" as const,
+        cpc_bid_ceiling: 5,
+      },
+      "target_impression_share_percentage is required",
+    ],
+    [
+      {
+        strategy: "TARGET_IMPRESSION_SHARE",
+        target_impression_share_location: "TOP_OF_PAGE" as const,
+        target_impression_share_percentage: 80,
+      },
+      "cpc_bid_ceiling is required",
+    ],
+    [
+      {
+        strategy: "MAXIMIZE_CONVERSIONS",
+        target_impression_share_location: "TOP_OF_PAGE" as const,
+      },
+      "target_impression_share_location is only valid",
+    ],
+  ])("rejects incomplete or inconsistent parameters", (params, message) => {
+    expect(() => buildBiddingStrategy(params)).toThrow(message);
   });
 });

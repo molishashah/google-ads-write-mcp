@@ -13,6 +13,11 @@ import {
   extractResourceNames,
 } from "@/lib/google-ads-utils";
 import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
+import {
+  buildSearchCampaignBiddingStrategy,
+  TARGET_IMPRESSION_SHARE_LOCATIONS,
+  type SearchCampaignBiddingInput,
+} from "@/tools/campaign-bidding";
 
 // ──────────────────────────────────────────────────────────────────────
 // Campaign structure tools (create campaign + ad group)
@@ -24,9 +29,9 @@ import { mcpJsonError, mcpSuccess } from "@/lib/mcp-helpers";
 // Safety choices (matching the rest of this server):
 //   - New campaigns default to PAUSED. Callers can explicitly set ENABLED
 //     when they want a complete UI-free launch.
-//   - Bidding is Maximize Clicks (the `target_spend` strategy). It needs
-//     no conversion history, so it is the safe default for a brand-new
-//     campaign. Switch strategies in the UI later if you want.
+//   - Bidding defaults to Maximize Clicks (the `target_spend` strategy). It
+//     needs no conversion history, so it remains the safe default for a
+//     brand-new campaign. Target Impression Share can be selected explicitly.
 //   - There is deliberately NO remove/delete tool. Pausing (pause_campaign,
 //     pause_ad_group) stops spend and is reversible; a REMOVED resource is
 //     permanent. Pause is always the right lever here.
@@ -46,6 +51,64 @@ type MutateResponse = {
   }>;
 };
 
+export type CreateCampaignInput = SearchCampaignBiddingInput & {
+  customer_id: string;
+  name: string;
+  daily_budget: number;
+  include_search_partners?: boolean;
+  include_display_network?: boolean;
+  start_date?: string;
+  end_date?: string;
+  initial_status?: "PAUSED" | "ENABLED";
+};
+
+export function buildCreateCampaignOperations(
+  params: CreateCampaignInput,
+  budgetNameSuffix: number | string = Date.now()
+): MutateOperation<Record<string, unknown>>[] {
+  const cid = params.customer_id;
+  const budgetTmp = ResourceNames.campaignBudget(cid, "-1");
+
+  return [
+    {
+      entity: "campaign_budget",
+      operation: "create",
+      resource: {
+        resource_name: budgetTmp,
+        name: `${params.name} — budget (${budgetNameSuffix})`,
+        amount_micros: toMicros(params.daily_budget),
+        delivery_method: enums.BudgetDeliveryMethod.STANDARD,
+        explicitly_shared: false,
+      },
+    },
+    {
+      entity: "campaign",
+      operation: "create",
+      resource: {
+        name: params.name,
+        status: enumValue(
+          enums.CampaignStatus,
+          params.initial_status ?? "PAUSED"
+        ),
+        advertising_channel_type: enums.AdvertisingChannelType.SEARCH,
+        campaign_budget: budgetTmp,
+        contains_eu_political_advertising:
+          enums.EuPoliticalAdvertisingStatus
+            .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
+        ...buildSearchCampaignBiddingStrategy(params),
+        network_settings: {
+          target_google_search: true,
+          target_search_network: params.include_search_partners ?? true,
+          target_content_network: params.include_display_network ?? false,
+          target_partner_search_network: false,
+        },
+        ...(params.start_date ? { start_date: params.start_date } : {}),
+        ...(params.end_date ? { end_date: params.end_date } : {}),
+      },
+    },
+  ];
+}
+
 export function registerCampaignTools(server: McpServer) {
   registerCreateCampaign(server);
   registerCreateAdGroup(server);
@@ -61,9 +124,9 @@ function registerCreateCampaign(server: McpServer) {
         "Create a new Search campaign with its own daily budget, in a " +
         "single atomic operation. The campaign defaults to PAUSED so it " +
         "never starts spending on its own, but you can pass " +
-        "initial_status=ENABLED for UI-free launch after setup. Bidding is set to Maximize Clicks " +
-        "(target_spend), which needs no conversion history and is the safe " +
-        "default for a new campaign. To retire a campaign later use " +
+        "initial_status=ENABLED for UI-free launch after setup. Bidding defaults to Maximize " +
+        "Clicks, or can use Target Impression Share for anywhere, top, or absolute-top " +
+        "placement. To retire a campaign later use " +
         "pause_campaign — there is no delete (a removed campaign is " +
         "permanent; a paused one is reversible).",
       inputSchema: {
@@ -89,8 +152,26 @@ function registerCreateCampaign(server: McpServer) {
           .positive()
           .optional()
           .describe(
-            "Optional max CPC bid limit (account currency) for the Maximize " +
-              "Clicks strategy. Omit to let Google manage bids with no ceiling."
+            "Max CPC bid limit in account currency. Optional for Maximize Clicks " +
+              "and required for Target Impression Share."
+          ),
+        bidding_strategy: z
+          .enum(["MAXIMIZE_CLICKS", "TARGET_IMPRESSION_SHARE"])
+          .optional()
+          .describe("Campaign bidding strategy. Default: MAXIMIZE_CLICKS."),
+        target_impression_share_location: z
+          .enum(TARGET_IMPRESSION_SHARE_LOCATIONS)
+          .optional()
+          .describe(
+            "Required for Target Impression Share: anywhere, top, or absolute top of the page."
+          ),
+        target_impression_share_percentage: z
+          .number()
+          .positive()
+          .max(100)
+          .optional()
+          .describe(
+            "Required for Target Impression Share. Desired impression share as a percentage greater than 0 and at most 100."
           ),
         include_search_partners: z
           .boolean()
@@ -139,63 +220,8 @@ function registerCreateCampaign(server: McpServer) {
       const tool = "create_campaign";
       try {
         const customer = getAdsClient(params.customer_id);
-        const cid = params.customer_id;
-
-        // Temp resource names with negative IDs let us create the budget and
-        // the campaign that references it in one atomic mutate. If either
-        // half fails (or validate_only is set), nothing is created — so we
-        // never leave an orphan budget behind.
-        const budgetTmp = ResourceNames.campaignBudget(cid, "-1");
-
-        const operations: MutateOperation<Record<string, unknown>>[] = [
-          {
-            entity: "campaign_budget",
-            operation: "create",
-            resource: {
-              resource_name: budgetTmp,
-              // Budget name must be unique in the account; it's an internal
-              // artifact, so we make it collision-proof.
-              name: `${params.name} — budget (${Date.now()})`,
-              amount_micros: toMicros(params.daily_budget),
-              delivery_method: enums.BudgetDeliveryMethod.STANDARD,
-              explicitly_shared: false,
-            },
-          },
-          {
-            entity: "campaign",
-            operation: "create",
-            resource: {
-              name: params.name,
-              status: enumValue(
-                enums.CampaignStatus,
-                params.initial_status ?? "PAUSED"
-              ),
-              advertising_channel_type: enums.AdvertisingChannelType.SEARCH,
-              campaign_budget: budgetTmp,
-              // Required by the Google Ads API on campaign create. Augment
-              // does not run EU political ads, so this is always "does not
-              // contain". (Omitting it fails with field_error: REQUIRED.)
-              contains_eu_political_advertising:
-                enums.EuPoliticalAdvertisingStatus
-                  .DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING,
-              // Maximize Clicks = the target_spend bidding strategy.
-              target_spend:
-                params.cpc_bid_ceiling != null
-                  ? {
-                      cpc_bid_ceiling_micros: toMicros(params.cpc_bid_ceiling),
-                    }
-                  : {},
-              network_settings: {
-                target_google_search: true,
-                target_search_network: params.include_search_partners ?? true,
-                target_content_network: params.include_display_network ?? false,
-                target_partner_search_network: false,
-              },
-              ...(params.start_date ? { start_date: params.start_date } : {}),
-              ...(params.end_date ? { end_date: params.end_date } : {}),
-            },
-          },
-        ];
+        // Temp resource names let the budget and campaign be created atomically.
+        const operations = buildCreateCampaignOperations(params);
 
         const result = (await customer.mutateResources(operations, {
           validate_only: params.validate_only ?? false,
@@ -242,7 +268,7 @@ function registerCreateCampaign(server: McpServer) {
             budget: budgetRn,
             status: params.initial_status ?? "PAUSED",
             channel: "SEARCH",
-            bidding: "MAXIMIZE_CLICKS",
+            bidding: params.bidding_strategy ?? "MAXIMIZE_CLICKS",
             daily_budget: params.daily_budget,
             response: result,
           },
