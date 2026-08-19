@@ -25,7 +25,7 @@ The MCP endpoint is served at `/api/[transport]` and protected by `withMcpAuth`.
 | Ad groups/keywords | `create_ad_group`, ad group list/get/update/status/remove, positive keywords, campaign/ad group negatives, shared negative keyword sets |
 | Ads/assets/policy | `get_ad`, typed Search/Display/DSA/Shopping/Demand Gen/App ad creators, `replace_responsive_search_ad`, raw ad-format wrappers, asset create/list/get/remove/attach/detach, policy summary and ad-copy validation |
 | Conversions | conversion action CRUD, typed offline/website conversion action creators, customer/campaign/custom goals, biddable goal helpers, typed custom variables/value rules, upload tools, upload capability check, diagnostics |
-| Reporting/research | account/campaign/ad group/keyword/search term/ad/asset/landing page/geo/device/hour/conversion/change reports, typed keyword ideas, keyword planning, recommendations, allowlist-aware insights |
+| Reporting/research | account/campaign/ad group/keyword/search term/ad/asset/landing page/geo/device/hour/conversion/change reports, typed Keyword Planner research and forecasts, recommendations, allowlist-aware insights |
 | Experiments | ad-variation flow plus list/schedule/end/promote/remove/async-error tools with typed lifecycle shortcuts |
 | Account/admin | customer metadata, hierarchy, user access, manager/product links, billing/account-budget reads, change status, permission diagnostics |
 | Full-admin escape hatches | `mutate_google_ads_resources`, `call_google_ads_service_method` |
@@ -74,6 +74,32 @@ cp .env.local.example .env.local
 See `.env.local.example` for full notes.
 
 Some Google Ads tasks may still require Google UI/support outside the API: initial account access, some billing/payment setup, advertiser verification, and allowlisted/beta API surfaces.
+
+### Keyword Planner
+
+The Keyword Planner integration exposes typed tools for the complete planless
+research workflow:
+
+- `generate_keyword_ideas` accepts keyword, page URL, site, or combined keyword
+  and URL seeds, plus targeting, historical options, annotations, and pagination.
+- `generate_keyword_historical_metrics` returns search volume, competition,
+  bid ranges, average CPC, monthly volumes, and close variants.
+- `generate_keyword_forecast` builds a planless campaign forecast from typed ad
+  groups, match types, targeting, dates, currency, and bidding strategy inputs.
+- `generate_ad_group_themes` organizes proposed keywords into existing ad groups.
+- `suggest_keyword_planner_geo_targets` resolves human-readable locations to geo
+  target constants.
+- `list_keyword_planner_languages` lists targetable language constants.
+
+The four planning RPC tools preserve the raw Google response fields and add a
+`normalized` result with named enums, currency values alongside micros, counts,
+and explicit campaign-level forecast scope. A raw `request` remains available as
+an advanced escape hatch.
+
+Google applies separate per-customer rate limits to Keyword Planning. This
+server spaces calls per warm application instance, coalesces identical in-flight
+requests, and retries a quota-exhausted request once. Multi-instance deployments
+that need a strict global limit should add a distributed rate limiter.
 
 ### Run locally
 
