@@ -60,6 +60,36 @@ describe.skipIf(!runIntegration || !customerId)(
       expect(result.campaign_forecast_metrics).toBeDefined();
     });
 
+    it("validates an atomic saved keyword plan", async () => {
+      const { getAdsClient } = await import("@/lib/ads-client");
+      const { buildCreateSavedKeywordPlanOperations } = await import(
+        "./saved-keyword-plans"
+      );
+      const customer = getAdsClient(customerId!);
+      const operations = buildCreateSavedKeywordPlanOperations({
+        customer_id: customerId!,
+        name: `MCP validation ${Date.now()}`,
+        forecast_period: { date_interval: "NEXT_MONTH" },
+        campaign: {
+          name: "MCP validation campaign",
+          cpc_bid_micros: 1_000_000,
+        },
+        ad_groups: [
+          {
+            name: "Running shoes",
+            keywords: [
+              { text: "running shoes", match_type: "PHRASE" },
+            ],
+          },
+        ],
+      });
+      const result = await customer.mutateResources(operations, {
+        validate_only: true,
+        partial_failure: false,
+      });
+      expect(result).toBeDefined();
+    });
+
     it.runIf(Boolean(adGroupId))(
       "generates ad group themes",
       async () => {

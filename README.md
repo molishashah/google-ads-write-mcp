@@ -91,6 +91,23 @@ research workflow:
   target constants.
 - `list_keyword_planner_languages` lists targetable language constants.
 
+Saved-plan lifecycle tools extend that workflow when a reusable plan is needed:
+
+- `list_saved_keyword_plans` and `get_saved_keyword_plan` inspect plans and their
+  complete campaign, ad-group, and keyword structure.
+- `create_saved_keyword_plan` creates an empty plan or atomically saves a full
+  forecast structure with its campaign, ad groups, positive/negative ad-group
+  keywords, and campaign-level negative keywords.
+- `update_saved_keyword_plan`, `remove_saved_keyword_plan`, and
+  `update_saved_keyword_plan_campaign` manage the plan and its single campaign.
+- `mutate_saved_keyword_plan_ad_groups` and
+  `mutate_saved_keyword_plan_keywords` batch typed create, update, and remove
+  operations. Batches are atomic unless `partial_failure` is explicitly enabled.
+
+The composite create tool uses Google Ads temporary resource names so every
+parent-child reference is resolved in one request. `validate_only` runs the same
+request without persisting it.
+
 The four planning RPC tools preserve the raw Google response fields and add a
 `normalized` result with named enums, currency values alongside micros, counts,
 and explicit campaign-level forecast scope. A raw `request` remains available as
